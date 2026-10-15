@@ -32,7 +32,15 @@ Stacking of various (multilinear) polynomials into a single -big- (multilinear) 
 #[derive(Debug)]
 pub struct StackedPcsWitness {
     pub stacked_n_vars: VarCount,
+    pub actual_data_len: usize,
     pub inner_witness: Witness<EF>,
+    pub global_polynomial: MleOwned<EF>,
+}
+
+#[derive(Debug)]
+pub struct StackedPcsPolynomial {
+    pub stacked_n_vars: VarCount,
+    pub actual_data_len: usize,
     pub global_polynomial: MleOwned<EF>,
 }
 
@@ -99,14 +107,12 @@ pub fn stacked_pcs_global_statements(
 }
 
 #[instrument(skip_all)]
-pub fn stack_polynomials_and_commit(
-    prover_state: &mut impl FSProver<EF>,
-    whir_config_builder: &WhirConfigBuilder,
+pub fn stack_polynomials(
     memory: &[F],
     memory_acc: &[F],
     bytecode_acc: &[F],
     traces: &BTreeMap<Table, TableTrace>,
-) -> StackedPcsWitness {
+) -> StackedPcsPolynomial {
     assert_eq!(memory.len(), memory_acc.len());
     let tables_heights = traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
     let tables_heights_sorted = sort_tables_by_height(&tables_heights);
@@ -148,12 +154,33 @@ pub fn stack_polynomials_and_commit(
         .green()
     );
 
-    let global_polynomial = MleOwned::Base(global_polynomial);
+    StackedPcsPolynomial {
+        stacked_n_vars,
+        actual_data_len: offset,
+        global_polynomial: MleOwned::Base(global_polynomial),
+    }
+}
+
+#[instrument(skip_all)]
+pub fn stack_polynomials_and_commit(
+    prover_state: &mut impl FSProver<EF>,
+    whir_config_builder: &WhirConfigBuilder,
+    memory: &[F],
+    memory_acc: &[F],
+    bytecode_acc: &[F],
+    traces: &BTreeMap<Table, TableTrace>,
+) -> StackedPcsWitness {
+    let StackedPcsPolynomial {
+        stacked_n_vars,
+        actual_data_len,
+        global_polynomial,
+    } = stack_polynomials(memory, memory_acc, bytecode_acc, traces);
 
     let inner_witness =
-        WhirConfig::new(whir_config_builder, stacked_n_vars).commit(prover_state, &global_polynomial, offset);
+        WhirConfig::new(whir_config_builder, stacked_n_vars).commit(prover_state, &global_polynomial, actual_data_len);
     StackedPcsWitness {
         stacked_n_vars,
+        actual_data_len,
         inner_witness,
         global_polynomial,
     }
@@ -178,6 +205,26 @@ pub fn stacked_pcs_parse_commitment(
         return Err(ProofError::InvalidProof);
     }
     WhirConfig::new(whir_config_builder, stacked_n_vars).parse_commitment(verifier_state)
+}
+
+pub fn stacked_pcs_parse_commitment_without_ood(
+    whir_config_builder: &WhirConfigBuilder,
+    verifier_state: &mut impl FSVerifier<EF>,
+    log_memory: usize,
+    log_bytecode: usize,
+    tables_heights: &BTreeMap<Table, VarCount>,
+) -> Result<ParsedCommitment<F, EF>, ProofError> {
+    if log_memory < *tables_heights.values().max().unwrap() {
+        return Err(ProofError::InvalidProof);
+    }
+
+    let stacked_n_vars = compute_stacked_n_vars(log_memory, log_bytecode, tables_heights);
+    if stacked_n_vars
+        > F::TWO_ADICITY + whir_config_builder.folding_factor.at_round(0) - whir_config_builder.starting_log_inv_rate
+    {
+        return Err(ProofError::InvalidProof);
+    }
+    WhirConfig::new(whir_config_builder, stacked_n_vars).parse_commitment_without_ood(verifier_state)
 }
 
 fn compute_stacked_n_vars(

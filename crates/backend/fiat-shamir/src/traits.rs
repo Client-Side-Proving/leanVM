@@ -13,6 +13,9 @@ pub trait ChallengeSampler<EF> {
 }
 
 pub trait FSProver<EF: KoalaBearExtension>: ChallengeSampler<EF> {
+    fn hash_profile(&self) -> symetric::ProofHashProfile {
+        symetric::ProofHashProfile::Poseidon1
+    }
     fn state(&self) -> String;
     fn add_base_scalars(&mut self, scalars: &[PF<EF>]);
     fn observe_scalars(&mut self, scalars: &[PF<EF>]);
@@ -44,6 +47,9 @@ pub trait FSProver<EF: KoalaBearExtension>: ChallengeSampler<EF> {
 }
 
 pub trait FSVerifier<EF: KoalaBearExtension>: ChallengeSampler<EF> {
+    fn hash_profile(&self) -> symetric::ProofHashProfile {
+        symetric::ProofHashProfile::Poseidon1
+    }
     fn state(&self) -> String;
     fn next_base_scalars_vec(&mut self, n: usize) -> Result<Vec<PF<EF>>, ProofError>;
     fn observe_scalars(&mut self, scalars: &[PF<EF>]);

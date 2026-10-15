@@ -5,8 +5,8 @@ use fiat_shamir::{FSProver, MerklePath, ProofResult};
 use field::PrimeCharacteristicRing;
 use field::{Field, TwoAdicField};
 use sumcheck::{
-    ProductComputation, packing_unpack_sum, run_product_sumcheck_from_round1, run_product_sumcheck_from_round1_delayed,
-    sumcheck_prove_many_rounds,
+    ProductComputation, packing_unpack_sum, run_product_sumcheck, run_product_sumcheck_from_round1,
+    run_product_sumcheck_from_round2_delayed, sumcheck_prove_many_rounds,
 };
 use tracing::{info_span, instrument};
 use zk_alloc::ArenaVec;
@@ -56,6 +56,232 @@ where
         MultilinearPoint(round_state.randomness_vec)
     }
 
+    /// Prove while reconstructing a discarded first-round commitment leaf only
+    /// after the initial sumcheck has folded the committed polynomial.
+    #[instrument(name = "WHIR prove", skip_all)]
+    pub fn prove_rebuilding_commitment_leaf(
+        &self,
+        prover_state: &mut impl FSProver<EF>,
+        statement: Vec<SparseStatement<EF>>,
+        witness: Witness<EF>,
+        polynomial: MleOwned<EF>,
+        actual_data_len: usize,
+    ) -> MultilinearPoint<EF> {
+        assert!(self.validate_parameters());
+        assert!(self.validate_witness(&witness, &polynomial.by_ref()));
+        self.validate_statement(&statement);
+
+        let mut round_state =
+            RoundState::initialize_first_round_state(self, prover_state, statement, witness, &polynomial.by_ref())
+                .unwrap();
+
+        self.rebuild_commitment_leaf(&polynomial, actual_data_len, &mut round_state.merkle_prover_data);
+        drop(polynomial);
+
+        for round in 0..=self.n_rounds() {
+            self.round(round, prover_state, &mut round_state).unwrap();
+        }
+
+        MultilinearPoint(round_state.randomness_vec)
+    }
+
+    /// Proves two separately committed base-field polynomials through one WHIR
+    /// continuation. The commitment roots must already be observed without the
+    /// ordinary per-commitment OOD step. The caller must bind this proof shape
+    /// and `batching_pow_bits` in its protocol domain separator.
+    #[instrument(name = "WHIR prove two commitments", skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_two_commitments(
+        &self,
+        prover_state: &mut impl FSProver<EF>,
+        batching_pow_bits: usize,
+        primary_statement: Vec<SparseStatement<EF>>,
+        primary_witness: Witness<EF>,
+        primary_polynomial: &MleRef<'_, EF>,
+        secondary_statement: Vec<SparseStatement<EF>>,
+        secondary_witness: Witness<EF>,
+        secondary_polynomial: &MleRef<'_, EF>,
+    ) -> MultilinearPoint<EF> {
+        assert!(self.validate_parameters());
+        assert!(
+            self.n_rounds() > 0,
+            "two-commitment WHIR requires an intermediate commitment round"
+        );
+        assert!(
+            self.commitment_ood_samples > 0,
+            "two-commitment WHIR requires a combined OOD check"
+        );
+        assert!(self.validate_witness(&primary_witness, primary_polynomial));
+        assert!(self.validate_witness(&secondary_witness, secondary_polynomial));
+        assert!(primary_witness.ood_points.is_empty() && primary_witness.ood_answers.is_empty());
+        assert!(secondary_witness.ood_points.is_empty() && secondary_witness.ood_answers.is_empty());
+        assert!(!primary_statement.is_empty() && !secondary_statement.is_empty());
+        self.validate_statement(&primary_statement);
+        self.validate_statement(&secondary_statement);
+
+        prover_state.duplex();
+        let group_randomness: EF = prover_state.sample();
+        let primary_terms = build_lazy_combine_terms::<EF>(&primary_statement, group_randomness);
+        let secondary_terms = build_lazy_combine_terms::<EF>(&secondary_statement, group_randomness);
+        let primary_sum = primary_terms.combined_sum;
+        let secondary_sum = secondary_terms.combined_sum;
+        let primary_on_secondary = weighted_sum_base_polynomial(secondary_polynomial, &primary_terms);
+        let secondary_on_primary = weighted_sum_base_polynomial(primary_polynomial, &secondary_terms);
+
+        prover_state.add_extension_scalars(&[primary_on_secondary, secondary_on_primary]);
+        prover_state.pow_grinding(batching_pow_bits);
+        // The grinding predicate constrains one transcript output. Duplex before
+        // lambda so its extension-field distribution is the ordinary sampler's.
+        prover_state.duplex();
+        let polynomial_randomness: EF = prover_state.sample();
+        let combined_polynomial =
+            linear_combination_base_polynomials(primary_polynomial, secondary_polynomial, polynomial_randomness);
+
+        prover_state.duplex();
+        let (combined_ood_points, combined_ood_answers) =
+            sample_ood_points::<EF, _>(prover_state, self.commitment_ood_samples, self.num_variables, |point| {
+                combined_polynomial.evaluate(point)
+            });
+        let combined_ood_statements = combined_ood_points
+            .iter()
+            .copied()
+            .zip(combined_ood_answers.iter().copied())
+            .map(|(point, evaluation)| {
+                SparseStatement::dense(
+                    MultilinearPoint::expand_from_univariate(point, self.num_variables),
+                    evaluation,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        prover_state.duplex();
+        let statement_randomness: EF = prover_state.sample();
+        let statement_scales = statement_randomness
+            .powers()
+            .collect_n(combined_ood_statements.len() + 2);
+        let primary_scale = statement_scales[combined_ood_statements.len()];
+        let secondary_scale = statement_scales[combined_ood_statements.len() + 1];
+        let combined_ood_terms = build_lazy_combine_terms::<EF>(&combined_ood_statements, statement_randomness);
+        let combined_weights = materialize_scaled_weights(
+            &[
+                (&combined_ood_terms, EF::ONE),
+                (&primary_terms, primary_scale),
+                (&secondary_terms, secondary_scale),
+            ],
+            combined_polynomial.by_ref().packed_len(),
+        );
+        let claimed_sum = combined_ood_terms.combined_sum
+            + primary_scale * (primary_sum + polynomial_randomness * primary_on_secondary)
+            + secondary_scale * (secondary_on_primary + polynomial_randomness * secondary_sum);
+
+        let mut round_state = RoundState::initialize_linear_combination_first_round_state(
+            self,
+            prover_state,
+            primary_witness,
+            vec![(secondary_witness, polynomial_randomness)],
+            &combined_polynomial.by_ref(),
+            combined_weights,
+            claimed_sum,
+        )
+        .unwrap();
+
+        for round in 0..=self.n_rounds() {
+            self.round(round, prover_state, &mut round_state).unwrap();
+        }
+
+        MultilinearPoint(round_state.randomness_vec)
+    }
+
+    /// Open three separately committed base-field polynomials through one
+    /// continuation. Roots and claims must be bound before this call. The
+    /// caller also binds the protocol mode and its batching grinding budget.
+    #[instrument(name = "WHIR prove three commitments", skip_all)]
+    pub fn prove_three_commitments(
+        &self,
+        prover_state: &mut impl FSProver<EF>,
+        batching_pow_bits: usize,
+        statements: [Vec<SparseStatement<EF>>; 3],
+        witnesses: [Witness<EF>; 3],
+        polynomials: [&MleRef<'_, EF>; 3],
+    ) -> MultilinearPoint<EF> {
+        assert!(self.validate_parameters());
+        assert!(self.n_rounds() > 0 && self.commitment_ood_samples > 0);
+        for i in 0..3 {
+            assert!(self.validate_witness(&witnesses[i], polynomials[i]));
+            assert!(witnesses[i].ood_points.is_empty() && witnesses[i].ood_answers.is_empty());
+            assert!(!statements[i].is_empty());
+            self.validate_statement(&statements[i]);
+        }
+        prover_state.duplex();
+        let group_randomness = prover_state.sample();
+        let terms = statements
+            .each_ref()
+            .map(|group| build_lazy_combine_terms::<EF>(group, group_randomness));
+        let mut cross = [[EF::ZERO; 3]; 3];
+        let mut cross_values = Vec::with_capacity(6);
+        for i in 0..3 {
+            for j in 0..3 {
+                cross[i][j] = if i == j {
+                    terms[i].combined_sum
+                } else {
+                    let value = weighted_sum_base_polynomial(polynomials[j], &terms[i]);
+                    cross_values.push(value);
+                    value
+                };
+            }
+        }
+        // Row-major off-diagonal L_i(P_j), fixed before polynomial batching.
+        prover_state.add_extension_scalars(&cross_values);
+        prover_state.pow_grinding(batching_pow_bits);
+        prover_state.duplex();
+        let lambda: EF = prover_state.sample();
+        let scalars = [EF::ONE, lambda, lambda.square()];
+        let combined_polynomial = linear_combination_three_base_polynomials(polynomials, scalars);
+
+        prover_state.duplex();
+        let (ood_points, ood_answers) =
+            sample_ood_points::<EF, _>(prover_state, self.commitment_ood_samples, self.num_variables, |point| {
+                combined_polynomial.evaluate(point)
+            });
+        let ood_statements = ood_points
+            .iter()
+            .zip(&ood_answers)
+            .map(|(&point, &value)| {
+                SparseStatement::dense(
+                    MultilinearPoint::expand_from_univariate(point, self.num_variables),
+                    value,
+                )
+            })
+            .collect::<Vec<_>>();
+        prover_state.duplex();
+        let theta: EF = prover_state.sample();
+        let scales = theta.powers().collect_n(ood_statements.len() + 3);
+        let ood_terms = build_lazy_combine_terms::<EF>(&ood_statements, theta);
+        let mut weighted_terms = vec![(&ood_terms, EF::ONE)];
+        let mut claimed_sum = ood_terms.combined_sum;
+        for i in 0..3 {
+            let scale = scales[ood_statements.len() + i];
+            weighted_terms.push((&terms[i], scale));
+            claimed_sum += scale * (0..3).map(|j| scalars[j] * cross[i][j]).sum::<EF>();
+        }
+        let weights = materialize_scaled_weights(&weighted_terms, combined_polynomial.by_ref().packed_len());
+        let [primary, secondary, helper] = witnesses;
+        let mut round_state = RoundState::initialize_linear_combination_first_round_state(
+            self,
+            prover_state,
+            primary,
+            vec![(secondary, scalars[1]), (helper, scalars[2])],
+            &combined_polynomial.by_ref(),
+            weights,
+            claimed_sum,
+        )
+        .unwrap();
+        for round in 0..=self.n_rounds() {
+            self.round(round, prover_state, &mut round_state).unwrap();
+        }
+        MultilinearPoint(round_state.randomness_vec)
+    }
+
     fn round(
         &self,
         round_index: usize,
@@ -89,7 +315,7 @@ where
         });
 
         let full = 1 << folding_factor_next;
-        let (prover_data, root) = MerkleData::build(folded_matrix, full, full);
+        let (prover_data, root) = MerkleData::build(folded_matrix, full, full, prover_state.hash_profile());
 
         prover_state.add_base_scalars(&root);
 
@@ -114,7 +340,22 @@ where
             self.folding_factor.at_round(round_index) + round_state.commitment_merkle_prover_data_b.is_some() as usize,
         );
 
-        let stir_evaluations = if let Some(data_b) = &round_state.commitment_merkle_prover_data_b {
+        let stir_evaluations = if !round_state.linear_combination_merkle_prover_data.is_empty() {
+            let answers_a =
+                open_merkle_tree_at_challenges(&round_state.merkle_prover_data, prover_state, &stir_challenges_indexes);
+            let mut values = answers_a
+                .iter()
+                .map(|answer| answer.evaluate(&folding_randomness))
+                .collect::<Vec<_>>();
+            for (data, scalar) in &round_state.linear_combination_merkle_prover_data {
+                let answers = open_merkle_tree_at_challenges(data, prover_state, &stir_challenges_indexes);
+                assert_eq!(values.len(), answers.len());
+                for (value, answer) in values.iter_mut().zip(&answers) {
+                    *value += *scalar * answer.evaluate(&folding_randomness);
+                }
+            }
+            values
+        } else if let Some(data_b) = &round_state.commitment_merkle_prover_data_b {
             let answers_a =
                 open_merkle_tree_at_challenges(&round_state.merkle_prover_data, prover_state, &stir_challenges_indexes);
             let answers_b = open_merkle_tree_at_challenges(data_b, prover_state, &stir_challenges_indexes);
@@ -145,13 +386,18 @@ where
         // Randomness for combination
         prover_state.duplex();
         let combination_randomness_gen: EF = prover_state.sample();
-        let ood_combination_randomness: Vec<_> = combination_randomness_gen.powers().collect_n(ood_challenges.len());
+        // Reserve coefficient one for the carried sumcheck claim and weights.
+        let ood_combination_randomness: Vec<_> = combination_randomness_gen
+            .powers()
+            .skip(1)
+            .take(ood_challenges.len())
+            .collect();
         round_state
             .sumcheck_prover
             .add_new_equality(&ood_challenges, &ood_answers, &ood_combination_randomness);
         let stir_combination_randomness = combination_randomness_gen
             .powers()
-            .skip(ood_challenges.len())
+            .skip(ood_challenges.len() + 1)
             .take(stir_challenges.len())
             .collect::<Vec<_>>();
 
@@ -176,6 +422,7 @@ where
             PF::<EF>::two_adic_generator(log2_strict_usize(new_domain_size) - folding_factor_next);
         round_state.merkle_prover_data = prover_data;
         round_state.commitment_merkle_prover_data_b = None;
+        round_state.linear_combination_merkle_prover_data.clear();
 
         Ok(())
     }
@@ -320,6 +567,66 @@ fn open_merkle_tree_at_challenges<EF: KoalaBearExtension>(
     answers
 }
 
+fn weighted_sum_base_polynomial<EF: KoalaBearExtension>(
+    polynomial: &MleRef<'_, EF>,
+    terms: &LazyCombineTerms<EF>,
+) -> EF {
+    let packed = polynomial.pack();
+    let packed_ref = packed.by_ref();
+    let evals = packed_ref
+        .as_packed_base()
+        .expect("two-commitment WHIR currently requires base-field polynomials");
+    let mut packed_sum = parallel::map_reduce(
+        evals.len(),
+        || EFPacking::<EF>::ZERO,
+        |index| terms.value_at(index) * evals[index],
+        |left, right| left + right,
+    );
+    for &(index, delta) in &terms.overlay {
+        packed_sum += delta * evals[index];
+    }
+    packing_unpack_sum::<EF>(packed_sum)
+}
+
+fn linear_combination_base_polynomials<EF: KoalaBearExtension>(
+    primary: &MleRef<'_, EF>,
+    secondary: &MleRef<'_, EF>,
+    scalar: EF,
+) -> MleOwned<EF> {
+    assert_eq!(primary.n_vars(), secondary.n_vars());
+    let primary_packed = primary.pack();
+    let secondary_packed = secondary.pack();
+    let primary_ref = primary_packed.by_ref();
+    let secondary_ref = secondary_packed.by_ref();
+    let primary_values = primary_ref
+        .as_packed_base()
+        .expect("two-commitment WHIR currently requires base-field polynomials");
+    let secondary_values = secondary_ref
+        .as_packed_base()
+        .expect("two-commitment WHIR currently requires base-field polynomials");
+    assert_eq!(primary_values.len(), secondary_values.len());
+    let scalar = EFPacking::<EF>::from(scalar);
+    MleOwned::ExtensionPacked(ArenaVec::par_collect(primary_values.len(), |index| {
+        EFPacking::<EF>::from(primary_values[index]) + scalar * secondary_values[index]
+    }))
+}
+
+fn linear_combination_three_base_polynomials<EF: KoalaBearExtension>(
+    polynomials: [&MleRef<'_, EF>; 3],
+    scalars: [EF; 3],
+) -> MleOwned<EF> {
+    assert!(polynomials.iter().all(|p| p.n_vars() == polynomials[0].n_vars()));
+    let packed = polynomials.map(|polynomial| polynomial.pack());
+    let refs = packed.each_ref().map(|polynomial| polynomial.by_ref());
+    let values = refs
+        .each_ref()
+        .map(|polynomial| polynomial.as_packed_base().expect("base-field polynomial required"));
+    let scalars = scalars.map(EFPacking::<EF>::from);
+    MleOwned::ExtensionPacked(ArenaVec::par_collect(values[0].len(), |index| {
+        (0..3).map(|j| scalars[j] * values[j][index]).sum()
+    }))
+}
+
 #[derive(Debug, Clone)]
 pub struct SumcheckSingle<EF: KoalaBearExtension> {
     /// Evaluations of the polynomial `p(X)`.
@@ -428,15 +735,25 @@ where
 
         let terms = info_span!("build_lazy_combine_terms")
             .in_scope(|| build_lazy_combine_terms::<EF>(statement, combination_randomness));
-        let (first_poly, weights_buf) =
-            info_span!("combine_and_compute_first_round").in_scope(|| combine_and_compute_first_round(ev, &terms));
+        let first_poly = info_span!("compute_first_round").in_scope(|| compute_first_round(ev, &terms));
         prover_state.add_sumcheck_polynomial(&first_poly.coeffs, None);
         prover_state.pow_grinding(pow_bits);
         let r1: EF = prover_state.sample();
         let sum1 = first_poly.evaluate(r1);
         let (challenges, new_sum, folded_evals, folded_weights) = if folding_factor >= 4 {
-            run_product_sumcheck_from_round1_delayed(ev, &weights_buf, prover_state, r1, sum1, folding_factor, pow_bits)
+            let (second_poly, folded_weights) = info_span!("compute_second_round_and_fold_weights")
+                .in_scope(|| compute_second_round_and_fold_weights(ev, &terms, r1, sum1));
+            run_product_sumcheck_from_round2_delayed(
+                ev,
+                folded_weights,
+                prover_state,
+                r1,
+                second_poly,
+                folding_factor,
+                pow_bits,
+            )
         } else {
+            let weights_buf = materialize_weights(&terms, ev.len());
             let weights = Mle::Owned(MleOwned::ExtensionPacked(weights_buf));
             run_product_sumcheck_from_round1(
                 &evals.by_ref(),
@@ -457,6 +774,36 @@ where
             challenges,
         )
     }
+
+    #[instrument(skip_all)]
+    fn run_initial_sumcheck_rounds_materialized(
+        evals: &MleRef<'_, EF>,
+        weights: MleOwned<EF>,
+        claimed_sum: EF,
+        prover_state: &mut impl FSProver<EF>,
+        folding_factor: usize,
+        pow_bits: usize,
+    ) -> (Self, MultilinearPoint<EF>) {
+        assert_ne!(folding_factor, 0);
+        let evals = evals.pack();
+        let weights = weights.pack();
+        let (challenges, new_sum, folded_evals, folded_weights) = run_product_sumcheck(
+            &evals.by_ref(),
+            &weights.by_ref(),
+            prover_state,
+            claimed_sum,
+            folding_factor,
+            pow_bits,
+        );
+        (
+            Self {
+                evals: folded_evals,
+                weights: folded_weights,
+                sum: new_sum,
+            },
+            challenges,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -468,6 +815,7 @@ where
     next_domain_gen: PF<EF>,
     sumcheck_prover: SumcheckSingle<EF>,
     commitment_merkle_prover_data_b: Option<MerkleData<EF>>,
+    linear_combination_merkle_prover_data: Vec<(MerkleData<EF>, EF)>,
     merkle_prover_data: MerkleData<EF>,
     randomness_vec: Vec<EF>,
 }
@@ -518,6 +866,41 @@ where
             sumcheck_prover,
             merkle_prover_data: witness.prover_data,
             commitment_merkle_prover_data_b: None,
+            linear_combination_merkle_prover_data: Vec::new(),
+            randomness_vec: folding_randomness.0.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_linear_combination_first_round_state(
+        prover: &WhirConfig<EF>,
+        prover_state: &mut impl FSProver<EF>,
+        primary_witness: Witness<EF>,
+        additional_witnesses: Vec<(Witness<EF>, EF)>,
+        combined_polynomial: &MleRef<'_, EF>,
+        combined_weights: MleOwned<EF>,
+        claimed_sum: EF,
+    ) -> ProofResult<Self> {
+        let (sumcheck_prover, folding_randomness) = SumcheckSingle::run_initial_sumcheck_rounds_materialized(
+            combined_polynomial,
+            combined_weights,
+            claimed_sum,
+            prover_state,
+            prover.folding_factor.at_round(0),
+            prover.starting_folding_pow_bits,
+        );
+        Ok(Self {
+            domain_size: prover.starting_domain_size(),
+            next_domain_gen: PF::<EF>::two_adic_generator(
+                log2_strict_usize(prover.starting_domain_size()) - prover.folding_factor.at_round(0),
+            ),
+            sumcheck_prover,
+            merkle_prover_data: primary_witness.prover_data,
+            commitment_merkle_prover_data_b: None,
+            linear_combination_merkle_prover_data: additional_witnesses
+                .into_iter()
+                .map(|(witness, scalar)| (witness.prover_data, scalar))
+                .collect(),
             randomness_vec: folding_randomness.0.clone(),
         })
     }
@@ -736,28 +1119,54 @@ fn gather_run_terms<'a, EF: KoalaBearExtension>(
     Some(n)
 }
 
-/// One parallel pass: write the rounds-1+ weight buffer and accumulate the round-0 quadratic.
-fn combine_and_compute_first_round<EF>(
-    evals: &[PFPacking<EF>],
-    terms: &LazyCombineTerms<EF>,
-) -> (DensePolynomial<EF>, ArenaVec<EFPacking<EF>>)
+fn lazy_run_log<EF: KoalaBearExtension>(terms: &LazyCombineTerms<EF>, count: usize) -> usize {
+    let mut run_log = ::utils::log2_strict_usize(count.max(1));
+    for term in &terms.full {
+        run_log = run_log.min(term.rshift);
+    }
+    if !terms.grid.is_empty() {
+        run_log = run_log.min(terms.grid_log);
+    }
+    run_log
+}
+
+fn materialize_weights<EF: KoalaBearExtension>(terms: &LazyCombineTerms<EF>, len: usize) -> ArenaVec<EFPacking<EF>> {
+    let mut weights = ArenaVec::par_collect(len, |i| terms.value_at(i));
+    for &(index, delta) in &terms.overlay {
+        weights[index] += delta;
+    }
+    weights
+}
+
+fn materialize_scaled_weights<EF: KoalaBearExtension>(
+    groups: &[(&LazyCombineTerms<EF>, EF)],
+    len: usize,
+) -> MleOwned<EF> {
+    let mut weights = ArenaVec::par_collect(len, |index| {
+        groups.iter().fold(EFPacking::<EF>::ZERO, |sum, (terms, scale)| {
+            sum + terms.value_at(index) * *scale
+        })
+    });
+    for (terms, scale) in groups {
+        for &(index, delta) in &terms.overlay {
+            weights[index] += delta * *scale;
+        }
+    }
+    MleOwned::ExtensionPacked(weights)
+}
+
+/// Computes the first product-sumcheck polynomial without materializing the
+/// extension-field weight vector.
+fn compute_first_round<EF>(evals: &[PFPacking<EF>], terms: &LazyCombineTerms<EF>) -> DensePolynomial<EF>
 where
     EF: KoalaBearExtension,
     EFPacking<EF>: std::ops::Mul<PFPacking<EF>, Output = EFPacking<EF>> + std::ops::Mul<EF, Output = EFPacking<EF>>,
 {
     let n = evals.len();
     let half = n / 2;
-    let mut weights = unsafe { ArenaVec::<EFPacking<EF>>::uninitialized(n) };
-    let wp = parallel::SendPtr(weights.as_mut_ptr());
 
     // Run length keeps each term's context constant, so the inner loop can hoist it.
-    let mut run_log = ::utils::log2_strict_usize(half.max(1));
-    for t in &terms.full {
-        run_log = run_log.min(t.rshift);
-    }
-    if !terms.grid.is_empty() {
-        run_log = run_log.min(terms.grid_log);
-    }
+    let run_log = lazy_run_log(terms, half);
     let run = 1usize << run_log;
     let n_runs = half >> run_log;
 
@@ -780,10 +1189,6 @@ where
                     let i = j0 + t;
                     let w0 = terms.value_at(i);
                     let w1 = terms.value_at(half + i);
-                    unsafe {
-                        *wp.add(i) = w0;
-                        *wp.add(half + i) = w1;
-                    }
                     acc0 += w0 * evals[i];
                     acc2 += (w1 - w0) * (evals[half + i] - evals[i]);
                 }
@@ -802,10 +1207,6 @@ where
                 for term in terms_hi {
                     w1 += term.0[t] * term.1;
                 }
-                unsafe {
-                    *wp.add(j0 + t) = w0;
-                    *wp.add(half + j0 + t) = w1;
-                }
                 acc0 += w0 * e_lo[t];
                 acc2 += (w1 - w0) * (e_hi[t] - e_lo[t]);
             }
@@ -814,9 +1215,8 @@ where
         |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
     );
 
-    // apply overlay: patch buffer, correct accumulators
+    // Apply the sparse overlay directly to the round polynomial.
     for &(idx, delta) in &terms.overlay {
-        weights[idx] += delta;
         if idx < half {
             // d c0 = delta·e0 ; d c2 = -delta·(e1 - e0)
             c0p += delta * evals[idx];
@@ -830,5 +1230,119 @@ where
     let c0 = packing_unpack_sum::<EF>(c0p);
     let c2 = packing_unpack_sum::<EF>(c2p);
     let c1 = terms.combined_sum - c0.double() - c2;
-    (DensePolynomial::new(vec![c0, c1, c2]), weights)
+    DensePolynomial::new(vec![c0, c1, c2])
+}
+
+/// Computes the second product-sumcheck polynomial and writes only the weights
+/// folded by the already sampled first challenge.
+fn compute_second_round_and_fold_weights<EF>(
+    evals: &[PFPacking<EF>],
+    terms: &LazyCombineTerms<EF>,
+    r1: EF,
+    sum_after_r1: EF,
+) -> (DensePolynomial<EF>, ArenaVec<EFPacking<EF>>)
+where
+    EF: KoalaBearExtension,
+    EFPacking<EF>: std::ops::Mul<PFPacking<EF>, Output = EFPacking<EF>> + std::ops::Mul<EF, Output = EFPacking<EF>>,
+{
+    let n = evals.len();
+    let half = n / 2;
+    let quarter = n / 4;
+    let r1p = EFPacking::<EF>::from(r1);
+    let mut folded_weights = unsafe { ArenaVec::<EFPacking<EF>>::uninitialized(half) };
+    let folded_ptr = parallel::SendPtr(folded_weights.as_mut_ptr());
+
+    let run_log = lazy_run_log(terms, quarter);
+    let run = 1usize << run_log;
+    let n_runs = quarter >> run_log;
+
+    type Quad<EF> = (EFPacking<EF>, EFPacking<EF>, EFPacking<EF>, EFPacking<EF>);
+    type RunBuffers<'a, EF> = [[(&'a [EFPacking<EF>], EF); MAX_RUN_TERMS]; 4];
+    let (mut p0, mut p1, mut s0, mut s1) = parallel::map_reduce(
+        n_runs,
+        || {
+            (
+                EFPacking::<EF>::ZERO,
+                EFPacking::<EF>::ZERO,
+                EFPacking::<EF>::ZERO,
+                EFPacking::<EF>::ZERO,
+            )
+        },
+        |run_index| {
+            let j0 = run_index << run_log;
+            let mut acc: Quad<EF> = Default::default();
+            let mut buffers: RunBuffers<'_, EF> = [[(&[], EF::ZERO); MAX_RUN_TERMS]; 4];
+            let counts = [
+                gather_run_terms(terms, j0, run, &mut buffers[0]),
+                gather_run_terms(terms, quarter + j0, run, &mut buffers[1]),
+                gather_run_terms(terms, half + j0, run, &mut buffers[2]),
+                gather_run_terms(terms, half + quarter + j0, run, &mut buffers[3]),
+            ];
+
+            for t in 0..run {
+                let i = j0 + t;
+                let mut weights = [EFPacking::<EF>::ZERO; 4];
+                for quadrant in 0..4 {
+                    if let Some(count) = counts[quadrant] {
+                        for term in &buffers[quadrant][..count] {
+                            weights[quadrant] += term.0[t] * term.1;
+                        }
+                    } else {
+                        weights[quadrant] = terms.value_at(quadrant * quarter + i);
+                    }
+                }
+
+                let y_0 = r1p * (weights[2] - weights[0]) + weights[0];
+                let y_1 = r1p * (weights[3] - weights[1]) + weights[1];
+                unsafe {
+                    *folded_ptr.add(i) = y_0;
+                    *folded_ptr.add(quarter + i) = y_1;
+                }
+
+                let e_0 = evals[i];
+                let e_1 = evals[half + i];
+                let e_2 = evals[quarter + i];
+                let e_3 = evals[half + quarter + i];
+                let dy = y_1 - y_0;
+                acc.0 += y_0 * e_0;
+                acc.1 += y_0 * (e_1 - e_0);
+                acc.2 += dy * (e_2 - e_0);
+                acc.3 += dy * ((e_3 - e_2) - (e_1 - e_0));
+            }
+            acc
+        },
+        |(a, b, c, d), (e, f, g, h)| (a + e, b + f, c + g, d + h),
+    );
+
+    // Apply sparse overlay deltas to the folded weights and polynomial.
+    for &(index, delta) in &terms.overlay {
+        let (folded_index, folded_delta) = if index < half {
+            (index, delta * (EF::ONE - r1))
+        } else {
+            (index - half, delta * r1)
+        };
+        folded_weights[folded_index] += folded_delta;
+
+        let low_index = folded_index % quarter;
+        let e_0 = evals[low_index];
+        let e_1 = evals[half + low_index];
+        if folded_index < quarter {
+            let e_2 = evals[quarter + low_index];
+            let e_3 = evals[half + quarter + low_index];
+            p0 += folded_delta * e_0;
+            p1 += folded_delta * (e_1 - e_0);
+            s0 -= folded_delta * (e_2 - e_0);
+            s1 -= folded_delta * ((e_3 - e_2) - (e_1 - e_0));
+        } else {
+            let e_2 = evals[quarter + low_index];
+            let e_3 = evals[half + quarter + low_index];
+            s0 += folded_delta * (e_2 - e_0);
+            s1 += folded_delta * ((e_3 - e_2) - (e_1 - e_0));
+        }
+    }
+
+    let c0 = packing_unpack_sum::<EF>(p0) + r1 * packing_unpack_sum::<EF>(p1);
+    let c2 = packing_unpack_sum::<EF>(s0) + r1 * packing_unpack_sum::<EF>(s1);
+    let c1 = sum_after_r1 - c0.double() - c2;
+    (DensePolynomial::new(vec![c0, c1, c2]), folded_weights)
 }

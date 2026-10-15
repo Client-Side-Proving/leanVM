@@ -9,6 +9,7 @@ use lean_vm::{
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use sub_protocols::{
     AirSumcheckSession, OuterSumcheckSession, natural_ordering_point_for_session, prove_batched_air_sumcheck,
+    reorder_columns_for_air,
 };
 const HALF_DIGEST_LEN: usize = 4;
 
@@ -64,17 +65,11 @@ fn test_prove_poseidon() {
     let extra_data = ExtraDataForBuses::new(&[], air_alpha_powers);
     prover_state.duplex();
     let eq_factor: Vec<EF> = prover_state.sample_vec(log_n_rows);
-    let column_refs: Vec<&[F]> = trace.iter().map(|c| c.as_slice()).collect();
-    let packed = MleGroupRef::<EF>::Base(column_refs).pack();
+    reorder_columns_for_air(&mut trace);
 
-    let mut sessions: Vec<Box<dyn OuterSumcheckSession<EF> + '_>> = vec![Box::new(AirSumcheckSession::new(
-        packed,
-        eq_factor,
-        EF::ZERO,
-        air,
-        extra_data,
-        n_rows,
-    ))];
+    let mut sessions: Vec<Box<dyn OuterSumcheckSession<EF> + '_>> = vec![Box::new(
+        AirSumcheckSession::new_owned_reordered(trace, eq_factor, EF::ZERO, air, extra_data, n_rows),
+    )];
 
     let sumcheck_air_point = prove_batched_air_sumcheck(&mut prover_state, &mut sessions);
     let col_evals = sessions[0].final_column_evals();

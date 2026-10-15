@@ -1,0 +1,36 @@
+[package]
+name = "spartan_whir_guest"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+backend.workspace = true
+include_dir.workspace = true
+lean_compiler.workspace = true
+lean_prover.workspace = true
+lean_vm.workspace = true
+postcard.workspace = true
+rec_aggregation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+system-info.workspace = true
+
+[dev-dependencies]
+sub_protocols.workspace = true
+criterion = "0.8"
+
+[[bench]]
+name = "spark_guest_optimization"
+harness = false
+
+[[bench]]
+name = "spark_generic_verifier"
+harness = false
+
+[[bench]]
+name = "withdrawal_recursion"
+harness = false

@@ -111,6 +111,10 @@ impl Bytecode {
         self.hint_name_to_index.len()
     }
 
+    pub fn has_hint(&self, name: &str) -> bool {
+        self.hint_name_to_index.contains_key(name)
+    }
+
     #[inline]
     pub fn debug_info(&self) -> &BytecodeDebugInfo {
         &self.debug_info

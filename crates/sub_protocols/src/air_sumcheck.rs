@@ -47,7 +47,8 @@ where
     A::ExtraData: AlphaPowers<EF>,
     EFPacking<EF>: Algebra<KoalaBear>,
 {
-    multilinears: MleGroup<'a, EF>,
+    multilinears: Option<MleGroup<'a, EF>>,
+    reordered_base: Option<Vec<ArenaVec<PF<EF>>>>,
     eq_factor: Vec<EF>, // The last element is removed at each round
     /// Active element count in the current storage. Always a multiple of
     /// `2^{P - r}` while r < P (chunk-aligned), then ceil-halves afterward.
@@ -75,16 +76,8 @@ where
         non_padded_n_rows: usize,
     ) -> Self {
         let initial_n_vars = packed_multilinears.n_vars();
-        assert_eq!(eq_factor.len(), initial_n_vars);
-        let last_point = column_evals(&packed_multilinears.by_ref(), (1 << initial_n_vars) - 1);
-        let constraints_eval_at_padding = A::eval_extension(&computation, &last_point, &extra_data);
-
         let pivot = ENDIANNESS_PIVOT_AIR.min(initial_n_vars);
         let has_packed_phase = pivot > packing_log_width::<EF>();
-
-        let padded_n_rows = non_padded_n_rows
-            .next_multiple_of(1usize << pivot)
-            .min(1usize << initial_n_vars);
 
         let multilinears = match (packed_multilinears.by_ref(), has_packed_phase) {
             (MleGroupRef::BasePacked(cols), true) => {
@@ -110,8 +103,90 @@ where
             _ => unreachable!(),
         };
 
+        Self::from_reordered(multilinears, eq_factor, sum, computation, extra_data, non_padded_n_rows)
+    }
+
+    /// Construct a session that owns columns already reordered by
+    /// [`reorder_columns_for_air`]. The first challenge consumes these columns
+    /// one at a time, releasing each base-field buffer after it is folded.
+    pub fn new_owned_reordered(
+        reordered_base: Vec<ArenaVec<PF<EF>>>,
+        eq_factor: Vec<EF>,
+        sum: EF,
+        computation: A,
+        extra_data: A::ExtraData,
+        non_padded_n_rows: usize,
+    ) -> Self {
+        assert!(!reordered_base.is_empty());
+        let (initial_n_vars, constraints_eval_at_padding) = {
+            let refs = reordered_base.iter().map(|column| column.as_slice()).collect();
+            let packed = MleGroupRef::<EF>::Base(refs).pack();
+            let initial_n_vars = packed.n_vars();
+            let last_point = column_evals(&packed.by_ref(), (1 << initial_n_vars) - 1);
+            (
+                initial_n_vars,
+                A::eval_extension(&computation, &last_point, &extra_data),
+            )
+        };
+        Self::from_parts(
+            None,
+            Some(reordered_base),
+            initial_n_vars,
+            constraints_eval_at_padding,
+            eq_factor,
+            sum,
+            computation,
+            extra_data,
+            non_padded_n_rows,
+        )
+    }
+
+    fn from_reordered(
+        multilinears: MleGroup<'a, EF>,
+        eq_factor: Vec<EF>,
+        sum: EF,
+        computation: A,
+        extra_data: A::ExtraData,
+        non_padded_n_rows: usize,
+    ) -> Self {
+        let initial_n_vars = multilinears.n_vars();
+        assert_eq!(eq_factor.len(), initial_n_vars);
+        let last_point = column_evals(&multilinears.by_ref(), (1 << initial_n_vars) - 1);
+        let constraints_eval_at_padding = A::eval_extension(&computation, &last_point, &extra_data);
+        Self::from_parts(
+            Some(multilinears),
+            None,
+            initial_n_vars,
+            constraints_eval_at_padding,
+            eq_factor,
+            sum,
+            computation,
+            extra_data,
+            non_padded_n_rows,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        multilinears: Option<MleGroup<'a, EF>>,
+        reordered_base: Option<Vec<ArenaVec<PF<EF>>>>,
+        initial_n_vars: usize,
+        constraints_eval_at_padding: EF,
+        eq_factor: Vec<EF>,
+        sum: EF,
+        computation: A,
+        extra_data: A::ExtraData,
+        non_padded_n_rows: usize,
+    ) -> Self {
+        assert_eq!(eq_factor.len(), initial_n_vars);
+        let pivot = ENDIANNESS_PIVOT_AIR.min(initial_n_vars);
+        let padded_n_rows = non_padded_n_rows
+            .next_multiple_of(1usize << pivot)
+            .min(1usize << initial_n_vars);
+
         Self {
             multilinears,
+            reordered_base,
             eq_factor,
             current_unpadded_len: padded_n_rows,
             sum,
@@ -121,6 +196,19 @@ where
             initial_n_vars,
             constraints_eval_at_padding,
             rounds_done: 0,
+        }
+    }
+
+    fn multilinears_ref(&self) -> MleGroupRef<'_, EF> {
+        if let Some(columns) = &self.reordered_base {
+            MleGroupRef::BasePacked(
+                columns
+                    .iter()
+                    .map(|column| PFPacking::<EF>::pack_slice(column))
+                    .collect(),
+            )
+        } else {
+            self.multilinears.as_ref().unwrap().by_ref()
         }
     }
 }
@@ -242,7 +330,7 @@ where
         };
 
         let p_evals_raw = compute_raw_poly(
-            &self.multilinears.by_ref(),
+            &self.multilinears_ref(),
             &self.computation,
             &self.extra_data,
             &split_eq,
@@ -276,7 +364,58 @@ where
         let was_in_phase_1 = self.in_phase_1();
         let fold_bit = self.folding_bit_packed();
 
-        self.multilinears = self.multilinears.by_ref().fold_at_bit(challenge, fold_bit).into();
+        if let Some(base_columns) = self.reordered_base.take() {
+            let mut folded_columns = Vec::with_capacity(base_columns.len());
+            for column in base_columns {
+                let folded = fold_multilinear_at_bit::<EF, PFPacking<EF>, EFPacking<EF>, _, ArenaVec<EFPacking<EF>>>(
+                    PFPacking::<EF>::pack_slice(&column),
+                    challenge,
+                    fold_bit,
+                    &|value, scalar| (EFPacking::<EF>::ZERO + value) * scalar,
+                    false,
+                );
+                folded_columns.push(folded);
+                drop(column);
+            }
+            self.multilinears = Some(MleGroupOwned::ExtensionPacked(folded_columns).into());
+        } else {
+            let current = self.multilinears.take().unwrap();
+            self.multilinears = Some(match current {
+                MleGroup::Owned(MleGroupOwned::ExtensionPacked(columns)) => {
+                    let mut folded_columns = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        let folded =
+                            fold_multilinear_at_bit::<EF, EFPacking<EF>, EFPacking<EF>, _, ArenaVec<EFPacking<EF>>>(
+                                &column,
+                                challenge,
+                                fold_bit,
+                                &|value, scalar| value * scalar,
+                                false,
+                            );
+                        folded_columns.push(folded);
+                        drop(column);
+                    }
+                    MleGroupOwned::ExtensionPacked(folded_columns).into()
+                }
+                MleGroup::Owned(MleGroupOwned::Extension(columns)) => {
+                    let mut folded_columns = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        let folded = fold_multilinear_at_bit::<EF, EF, EF, _, ArenaVec<EF>>(
+                            &column,
+                            challenge,
+                            fold_bit,
+                            &|value, scalar| value * scalar,
+                            false,
+                        );
+                        folded_columns.push(folded);
+                        drop(column);
+                    }
+                    MleGroupOwned::Extension(folded_columns).into()
+                }
+                MleGroup::Owned(other) => other.by_ref().fold_at_bit(challenge, fold_bit).into(),
+                MleGroup::Ref(multilinears) => multilinears.fold_at_bit(challenge, fold_bit).into(),
+            });
+        }
 
         self.current_unpadded_len = self.current_unpadded_len.div_ceil(2);
         self.rounds_done += 1;
@@ -284,12 +423,24 @@ where
 
         // Phase 1 → phase 2: unpack
         if was_in_phase_1 && !self.in_phase_1() {
-            self.multilinears = self.multilinears.by_ref().unpack().as_owned_or_clone().into();
+            let current = self.multilinears.take().unwrap();
+            self.multilinears = Some(match current {
+                MleGroup::Owned(MleGroupOwned::ExtensionPacked(columns)) => {
+                    let mut unpacked_columns = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        unpacked_columns.push(unpack_extension(&column));
+                        drop(column);
+                    }
+                    MleGroupOwned::Extension(unpacked_columns).into()
+                }
+                MleGroup::Owned(other) => other.by_ref().unpack().as_owned_or_clone().into(),
+                MleGroup::Ref(multilinears) => multilinears.unpack().as_owned_or_clone().into(),
+            });
         }
     }
 
     fn final_column_evals(&self) -> Vec<EF> {
-        column_evals(&self.multilinears.by_ref(), 0)
+        column_evals(&self.multilinears_ref(), 0)
     }
 }
 
@@ -671,6 +822,36 @@ pub fn prove_batched_air_sumcheck<'a, EF: KoalaBearExtension>(
     }
 
     MultilinearPoint(challenges)
+}
+
+/// Apply the AIR sumcheck's chunk-local bit reversal directly to base-field
+/// columns before constructing an owning session.
+pub fn reorder_columns_for_air<F: Field>(columns: &mut [ArenaVec<F>]) {
+    if columns.is_empty() {
+        return;
+    }
+    let len = columns[0].len();
+    assert!(len.is_power_of_two());
+    let n_vars = len.trailing_zeros() as usize;
+    let pivot = ENDIANNESS_PIVOT_AIR.min(n_vars);
+    if pivot == 0 {
+        return;
+    }
+    let chunk_size = 1usize << pivot;
+    let shift = usize::BITS as usize - pivot;
+
+    parallel::par_chunks_mut(columns, 1, |_, slot| {
+        let column = &mut slot[0];
+        debug_assert_eq!(column.len(), 1 << n_vars);
+        for chunk in column.chunks_exact_mut(chunk_size) {
+            for i in 0..chunk_size {
+                let j = i.reverse_bits() >> shift;
+                if i < j {
+                    chunk.swap(i, j);
+                }
+            }
+        }
+    });
 }
 
 pub fn compute_shifted_columns<F: Field>(n_shift_columns: usize, columns: &[&[F]]) -> Vec<ArenaVec<F>> {

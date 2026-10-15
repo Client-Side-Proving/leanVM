@@ -25,12 +25,44 @@ pub(crate) fn merkle_commit<EF: ExtensionField<KoalaBear>>(
     matrix: Matrix<EF, ArenaVec<EF>>,
     full_n_cols: usize,
     effective_n_cols: usize,
+    hash_profile: symetric::ProofHashProfile,
 ) -> ([KoalaBear; DIGEST_ELEMS], RoundMerkleTree<KoalaBear>) {
     let dim = <EF as BasedVectorSpace<KoalaBear>>::DIMENSION;
     let base_values = flatten_to_base_arena::<KoalaBear, EF>(matrix.values);
     let base_matrix = Matrix::new(base_values, matrix.width * dim);
-    let tree = build_merkle_tree_koalabear(base_matrix, full_n_cols * dim, effective_n_cols * dim);
+    let tree = if hash_profile == symetric::ProofHashProfile::Keccak240 {
+        build_merkle_tree_keccak240(base_matrix, full_n_cols * dim)
+    } else {
+        build_merkle_tree_koalabear(base_matrix, full_n_cols * dim, effective_n_cols * dim)
+    };
     (tree.root(), tree)
+}
+
+fn build_merkle_tree_keccak240(
+    leaf: Matrix<KoalaBear, ArenaVec<KoalaBear>>,
+    full_base_width: usize,
+) -> RoundMerkleTree<KoalaBear> {
+    let mut first_layer = ArenaVec::filled([KoalaBear::ZERO; DIGEST_ELEMS], leaf.height());
+    parallel::par_chunks_mut(&mut first_layer, 1, |index, output| {
+        let mut values: Vec<_> = leaf.row(index).unwrap().collect();
+        values.resize(full_base_width, KoalaBear::ZERO);
+        output[0] = symetric::keccak240_leaf(&values);
+    });
+    let mut digest_layers = vec![first_layer];
+    while digest_layers.last().unwrap().len() > 1 {
+        let previous = digest_layers.last().unwrap();
+        let mut next = ArenaVec::filled([KoalaBear::ZERO; DIGEST_ELEMS], previous.len() / 2);
+        parallel::par_chunks_mut(&mut next, 1, |index, output| {
+            output[0] = symetric::keccak240_node(&previous[2 * index], &previous[2 * index + 1])
+                .expect("generated digests are canonical");
+        });
+        digest_layers.push(next);
+    }
+    WhirMerkleTree {
+        leaf,
+        tree: symetric::merkle::MerkleTree { digest_layers },
+        full_leaf_base_width: full_base_width,
+    }
 }
 
 #[instrument(name = "build merkle tree", skip_all)]
@@ -51,12 +83,21 @@ fn build_merkle_tree_koalabear(
     );
     let packed_state: [PFPacking<KoalaBear>; 16] =
         std::array::from_fn(|i| PFPacking::<KoalaBear>::from_fn(|_| scalar_state[i]));
-    let first_layer = first_digest_layer_with_initial_state::<PFPacking<KoalaBear>, _, _, DIGEST_ELEMS, 16, 8>(
-        &perm,
-        &leaf,
-        &packed_state,
-        effective_base_width,
-    );
+    let first_layer = if leaf.height() < PFPacking::<KoalaBear>::WIDTH {
+        first_digest_layer_with_initial_state::<KoalaBear, _, _, DIGEST_ELEMS, 16, 8>(
+            &perm,
+            &leaf,
+            &scalar_state,
+            effective_base_width,
+        )
+    } else {
+        first_digest_layer_with_initial_state::<PFPacking<KoalaBear>, _, _, DIGEST_ELEMS, 16, 8>(
+            &perm,
+            &leaf,
+            &packed_state,
+            effective_base_width,
+        )
+    };
     let tree = symetric::merkle::MerkleTree::from_first_layer::<PFPacking<KoalaBear>, _, 16>(&perm, first_layer);
     WhirMerkleTree {
         leaf,
@@ -79,7 +120,31 @@ pub(crate) fn merkle_verify<EF: ExtensionField<KoalaBear>>(
     dimension: Dimensions,
     data: Vec<EF>,
     proof: &Vec<[KoalaBear; DIGEST_ELEMS]>,
+    hash_profile: symetric::ProofHashProfile,
 ) -> bool {
+    if hash_profile == symetric::ProofHashProfile::Keccak240 {
+        if !dimension.height.is_power_of_two()
+            || index >= dimension.height
+            || data.len() != dimension.width
+            || proof.len() != utils::log2_strict_usize(dimension.height)
+            || symetric::decode_keccak240(&merkle_root).is_none()
+            || proof.iter().any(|digest| symetric::decode_keccak240(digest).is_none())
+        {
+            return false;
+        }
+        let mut current = symetric::keccak240_leaf(&EF::flatten_to_base(data));
+        let mut position = index;
+        for sibling in proof {
+            let (left, right) = if position & 1 == 0 {
+                (&current, sibling)
+            } else {
+                (sibling, &current)
+            };
+            current = symetric::keccak240_node(left, right).expect("digest limbs checked");
+            position >>= 1;
+        }
+        return current == merkle_root;
+    }
     let perm = default_koalabear_poseidon1_16();
     let log_max_height = utils::log2_strict_usize(dimension.height);
     let base_data = EF::flatten_to_base(data);
@@ -158,4 +223,82 @@ where
     });
 
     digests
+}
+
+#[cfg(test)]
+mod keccak_tests {
+    use super::*;
+    use symetric::ProofHashProfile;
+
+    #[test]
+    fn keccak_tree_opens_and_rejects_malformed_digests_and_paths() {
+        let values = ArenaVec::from_slice(&[1u32, 2, 3, 4, 5, 6].map(KoalaBear::from_u32));
+        let tree = build_merkle_tree_keccak240(Matrix::new(values, 3), 4);
+        let root = tree.root();
+        let (leaf, path) = tree.open(1);
+        let dims = Dimensions { height: 2, width: 4 };
+        assert!(merkle_verify(
+            root,
+            1,
+            dims,
+            leaf.clone(),
+            &path,
+            ProofHashProfile::Keccak240
+        ));
+        assert_eq!(leaf[3], KoalaBear::ZERO);
+        assert!(!merkle_verify(
+            root,
+            3,
+            dims,
+            leaf.clone(),
+            &path,
+            ProofHashProfile::Keccak240
+        ));
+        assert!(!merkle_verify(
+            root,
+            1,
+            dims,
+            leaf[..3].to_vec(),
+            &path,
+            ProofHashProfile::Keccak240
+        ));
+        let mut invalid_root = root;
+        invalid_root[0] = KoalaBear::from_u32(1 << 30);
+        assert!(!merkle_verify(
+            invalid_root,
+            1,
+            dims,
+            leaf.clone(),
+            &path,
+            ProofHashProfile::Keccak240
+        ));
+        let mut invalid_path = path.clone();
+        invalid_path[0][7] = KoalaBear::from_u32(1 << 30);
+        assert!(!merkle_verify(
+            root,
+            1,
+            dims,
+            leaf.clone(),
+            &invalid_path,
+            ProofHashProfile::Keccak240
+        ));
+        assert!(!merkle_verify(
+            root,
+            1,
+            dims,
+            leaf.clone(),
+            &vec![],
+            ProofHashProfile::Keccak240
+        ));
+        let mut changed_leaf = leaf;
+        changed_leaf[0] += KoalaBear::ONE;
+        assert!(!merkle_verify(
+            root,
+            1,
+            dims,
+            changed_leaf,
+            &path,
+            ProofHashProfile::Keccak240
+        ));
+    }
 }

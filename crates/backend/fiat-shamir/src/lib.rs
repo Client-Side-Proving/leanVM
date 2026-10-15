@@ -8,6 +8,7 @@ mod utils;
 pub use utils::*;
 
 mod challenger;
+mod keccak_challenger;
 
 mod traits;
 pub use traits::*;
@@ -21,4 +22,4 @@ pub(crate) use merkle_pruning::*;
 mod verifier;
 pub use verifier::*;
 
-const _: () = assert!(usize::BITS >= 32); // PoW grinding / Whir merkle index never exceeds 24 bits < 32
+const _: () = assert!(usize::BITS >= 32); // PoW grinding uses at most 30 bits; Merkle indices use at most 24.

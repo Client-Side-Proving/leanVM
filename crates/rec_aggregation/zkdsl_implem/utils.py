@@ -1,6 +1,9 @@
 from snark_lib import *
 from hashing import *
 
+UNIVARIATE_EVAL_HORNER = UNIVARIATE_EVAL_HORNER_PLACEHOLDER
+EXTENSION_SUBTRACTIONS = EXTENSION_SUBTRACTIONS_PLACEHOLDER
+
 F_BITS = 31  # koala-bear = 31 bits
 
 TWO_ADICITY = 24
@@ -39,10 +42,11 @@ def div_ceil_dynamic(a, b: Const):
 def powers(alpha, n):
     # alpha: EF
     # n: F
-    assert n < 400
+    # Continuation batching needs one extra power beyond its constraint count.
+    assert n <= 400
     assert 0 < n
     # 2**log2_ceil(i) is not really necessary but helps reduce bytecode size (tradeoff cycles / bytecode size)
-    res = match_range(n, range(1, 400), lambda i: powers_const(alpha, 2 ** log2_ceil(i)))
+    res = match_range(n, range(1, 401), lambda i: powers_const(alpha, 2 ** log2_ceil(i)))
     return res
 
 
@@ -62,8 +66,8 @@ def powers_const(alpha, n: Const):
 
 
 def compute_eq_mle_extension_dynamic(point, n):
-    debug_assert(n < 9)
-    res = match_range(n, range(0, 1), lambda _: ONE_EF_PTR, range(1, 9), lambda i: compute_eq_mle_extension(point, i))
+    debug_assert(n < 10)
+    res = match_range(n, range(0, 1), lambda _: ONE_EF_PTR, range(1, 10), lambda i: compute_eq_mle_extension(point, i))
     return res
 
 
@@ -167,8 +171,8 @@ def expand_from_univariate_base_const(alpha, n: Const):
 
 def expand_from_univariate_ext(alpha, n):
     debug_assert(0 < n)
-    debug_assert(n < 31)
-    res = match_range(n, range(1, 31), lambda nv: expand_from_univariate_ext_const(alpha, nv))
+    debug_assert(n < 33)
+    res = match_range(n, range(1, 33), lambda nv: expand_from_univariate_ext_const(alpha, nv))
     return res
 
 
@@ -209,14 +213,20 @@ def eval_multilinear_coeffs_rev(coeffs, point, n: Const):
 
 @inline
 def dot_product_be_dynamic(a, b, res, n):
-    debug_assert(n < 400)
-    match_range(n, range(1, 400), lambda i: dot_product_be(a, b, res, i))
+    if n == 512:
+        dot_product_be(a, b, res, 512)
+    else:
+        debug_assert(n < 400)
+        match_range(n, range(1, 400), lambda i: dot_product_be(a, b, res, i))
     return
 
 
 def dot_product_ee_dynamic(a, b, res, n):
-    debug_assert(n < 400)
-    match_range(n, range(1, 400), lambda i: dot_product_ee(a, b, res, i))
+    if n == 512:
+        dot_product_ee(a, b, res, 512)
+    else:
+        debug_assert(n < 400)
+        match_range(n, range(1, 400), lambda i: dot_product_ee(a, b, res, i))
     return
 
 
@@ -294,8 +304,11 @@ def one_minus_self_extension_ret(a):
 @inline
 def opposite_extension_ret(a):
     res = Array(DIM)
-    for i in unroll(0, DIM):
-        res[i] = 0 - a[i]
+    if EXTENSION_SUBTRACTIONS == 1:
+        add_ee(a, res, ZERO_VEC_PTR)
+    else:
+        for i in unroll(0, DIM):
+            res[i] = 0 - a[i]
     return res
 
 
@@ -335,6 +348,15 @@ def div_extension(n, d, res):
 
 
 @inline
+def div_extension_nonzero(n, d, res):
+    # The inverse constraint rejects zero denominators even with a preassigned quotient.
+    inverse = Array(DIM)
+    dot_product_ee(d, inverse, ONE_EF_PTR)
+    dot_product_ee(n, inverse, res)
+    return
+
+
+@inline
 def sub_extension(a, b, c):
     # c = a - b <=> a = c + b
     add_ee(b, c, a)
@@ -347,9 +369,16 @@ def sub_base_extension_ret(a, b):
     # b: extension
     # return a - b
     res = Array(DIM)
-    res[0] = a - b[0]
-    for i in unroll(1, DIM):
-        res[i] = 0 - b[i]
+    if EXTENSION_SUBTRACTIONS == 1:
+        base = Array(1)
+        base[0] = a
+        embedded = Array(DIM)
+        add_be(base, ZERO_VEC_PTR, embedded)
+        add_ee(b, res, embedded)
+    else:
+        res[0] = a - b[0]
+        for i in unroll(1, DIM):
+            res[i] = 0 - b[i]
     return res
 
 
@@ -368,8 +397,12 @@ def sub_extension_base_ret(a, b):
 @inline
 def sub_extension_ret(a, b):
     c = Array(DIM)
-    for i in unroll(0, DIM):
-        c[i] = a[i] - b[i]
+    if EXTENSION_SUBTRACTIONS == 1:
+        # The addition precompile fills c from the equivalent relation b+c=a.
+        add_ee(b, c, a)
+    else:
+        for i in unroll(0, DIM):
+            c[i] = a[i] - b[i]
     return c
 
 
@@ -447,9 +480,22 @@ def set_to_one(a):
 
 @inline
 def univariate_polynomial_eval(coeffs, point, degree):
-    powers = powers_const(point, degree + 1)
-    res = Array(DIM)
-    dot_product_ee(coeffs, powers, res, degree + 1)
+    res: Imm
+    if UNIVARIATE_EVAL_HORNER == 1:
+        if degree == 0:
+            res = coeffs
+        else:
+            values = Array(degree * DIM)
+            first_product = mul_extension_ret(coeffs + degree * DIM, point)
+            add_ee(first_product, coeffs + (degree - 1) * DIM, values)
+            for i in unroll(1, degree):
+                product = mul_extension_ret(values + (i - 1) * DIM, point)
+                add_ee(product, coeffs + (degree - i - 1) * DIM, values + i * DIM)
+            res = values + (degree - 1) * DIM
+    else:
+        powers = powers_const(point, degree + 1)
+        res = Array(DIM)
+        dot_product_ee(coeffs, powers, res, degree + 1)
     return res
 
 
@@ -607,6 +653,62 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks, lea
             lambda v: whir_3_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
         )
         prod *= nib_pow
+
+    return leaf_data, prod
+
+
+@inline
+def decompose_and_verify_merkle_query_small(a, domain_size, prev_root, num_chunks, leaf_iv):
+    nibbles = Array(6)
+    hint_decompose_bits_merkle_whir(nibbles, a, 4)
+
+    for i in unroll(0, 6):
+        assert nibbles[i] < 16
+
+    partial_sum: Mut = nibbles[0]
+    for i in unroll(1, 6):
+        partial_sum += nibbles[i] * 16**i
+
+    # p = 2^31 - 2^24 + 1, so 2^24 * 127 = p - 1 ≡ -1 (mod p), hence inv(2^24) = -127.
+    # Deduce top7 from the identity partial_sum + top7 * 2^24 == a:
+    # top7 = (a - partial_sum) * inv(2^24) = (partial_sum - a) * 127
+    top7 = (partial_sum - a) * 127
+    assert top7 < 2**7
+    if top7 == 2**7 - 1:
+        assert partial_sum == 0
+
+    leaf_data = Array(num_chunks * DIGEST_LEN)
+    hint_witness("merkle_leaf", leaf_data)
+    leaf_hash = slice_hash_rtl(leaf_data, num_chunks, leaf_iv)
+
+    merkle_path = Array(domain_size * DIGEST_LEN)
+    hint_witness("merkle_path", merkle_path)
+
+    # Trees of at most four levels use one nibble and no intermediate state.
+    prod: Imm
+    if domain_size == 0:
+        copy_8(leaf_hash, prev_root)
+        prod = 1
+    elif domain_size == 1:
+        prod = match_range(
+            nibbles[0], range(0, 16),
+            lambda v: whir_1_merkle_step_and_pow(v, leaf_hash, merkle_path, prev_root, 2 ** (TWO_ADICITY - 1)),
+        )
+    elif domain_size == 2:
+        prod = match_range(
+            nibbles[0], range(0, 16),
+            lambda v: whir_2_merkle_step_and_pow(v, leaf_hash, merkle_path, prev_root, 2 ** (TWO_ADICITY - 2)),
+        )
+    elif domain_size == 3:
+        prod = match_range(
+            nibbles[0], range(0, 16),
+            lambda v: whir_3_merkle_step_and_pow(v, leaf_hash, merkle_path, prev_root, 2 ** (TWO_ADICITY - 3)),
+        )
+    elif domain_size == 4:
+        prod = match_range(
+            nibbles[0], range(0, 16),
+            lambda v: whir_4_merkle_step_and_pow(v, leaf_hash, merkle_path, prev_root, 2 ** (TWO_ADICITY - 4)),
+        )
 
     return leaf_data, prod
 
@@ -778,4 +880,3 @@ def log2_ceil_runtime(n):
     assert log2 < 31
     match_range(log2, range(0, 31), lambda i: _verify_log2_ceil(n, i))
     return log2
-

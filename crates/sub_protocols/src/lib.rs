@@ -5,6 +5,8 @@ pub use air_sumcheck::*;
 mod logup;
 pub use logup::*;
 
+pub mod grouped_logup;
+
 mod stacked_pcs;
 pub use stacked_pcs::*;
 

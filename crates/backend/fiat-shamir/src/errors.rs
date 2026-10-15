@@ -41,7 +41,7 @@ impl From<TooBigTableError> for ProofError {
     }
 }
 
-/// two-addicity of kolalbear = 2^24. Using initial folding of 7 + rate = 1/2, we can commit up to 2^30 field elements.
+/// two-addicity of KoalaBear = 2^24. Using initial folding of 9 + rate = 1/2, we can commit up to 2^32 field elements.
 /// We cap the maximum size of each table to ensure we never need to commit more than that. see `ensure_not_too_big_commitment_surface`
 #[derive(Debug, Clone)]
 pub struct TooBigTableError {

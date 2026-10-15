@@ -4,15 +4,20 @@ from fiat_shamir import *
 WHIR_INITIAL_FOLDING_FACTOR = WHIR_INITIAL_FOLDING_FACTOR_PLACEHOLDER
 WHIR_SUBSEQUENT_FOLDING_FACTOR = WHIR_SUBSEQUENT_FOLDING_FACTOR_PLACEHOLDER
 WHIR_FIRST_RS_REDUCTION_FACTOR = WHIR_FIRST_RS_REDUCTION_FACTOR_PLACEHOLDER
+WHIR_DOMAIN_REDUCTION = WHIR_DOMAIN_REDUCTION_PLACEHOLDER
 MIN_WHIR_LOG_INV_RATE = MIN_WHIR_LOG_INV_RATE_PLACEHOLDER
 MAX_WHIR_LOG_INV_RATE = MAX_WHIR_LOG_INV_RATE_PLACEHOLDER
 MAX_NUM_VARIABLES_TO_SEND_COEFFS = MAX_NUM_VARIABLES_TO_SEND_COEFFS_PLACEHOLDER
+MIN_FINAL_WHIR_VARS = MIN_FINAL_WHIR_VARS_PLACEHOLDER
+MAX_FINAL_WHIR_VARS = MAX_FINAL_WHIR_VARS_PLACEHOLDER
 
 WHIR_ALL_POTENTIAL_NUM_QUERIES = WHIR_ALL_POTENTIAL_NUM_QUERIES_PLACEHOLDER
 WHIR_ALL_POTENTIAL_QUERY_GRINDING = WHIR_ALL_POTENTIAL_QUERY_GRINDING_PLACEHOLDER
 WHIR_ALL_POTENTIAL_NUM_OODS = WHIR_ALL_POTENTIAL_NUM_OODS_PLACEHOLDER
 WHIR_ALL_POTENTIAL_FOLDING_GRINDING = WHIR_ALL_POTENTIAL_FOLDING_GRINDING_PLACEHOLDER
 MIN_STACKED_N_VARS = MIN_STACKED_N_VARS_PLACEHOLDER
+MAX_STACKED_N_VARS_BY_RATE = MAX_STACKED_N_VARS_BY_RATE_PLACEHOLDER
+WHIR_VALID_DIMENSIONS = WHIR_VALID_DIMENSIONS_PLACEHOLDER
 
 
 def whir_open(
@@ -94,8 +99,8 @@ def whir_open(
     fs, final_coefficients = fs_receive_ef_by_log_dynamic(
         fs,
         n_final_vars,
-        MAX_NUM_VARIABLES_TO_SEND_COEFFS - WHIR_SUBSEQUENT_FOLDING_FACTOR,
-        MAX_NUM_VARIABLES_TO_SEND_COEFFS + 1,
+        MIN_FINAL_WHIR_VARS,
+        MAX_FINAL_WHIR_VARS + 1,
     )
 
     fs, all_stir_points[n_rounds], final_folds = sample_stir_indexes_and_fold(
@@ -116,7 +121,7 @@ def whir_open(
         final_pol_eval_on_stir_point = match_range(
             n_final_vars,
             range(
-                MAX_NUM_VARIABLES_TO_SEND_COEFFS - WHIR_SUBSEQUENT_FOLDING_FACTOR, MAX_NUM_VARIABLES_TO_SEND_COEFFS + 1
+                MIN_FINAL_WHIR_VARS, MAX_FINAL_WHIR_VARS + 1
             ),
             lambda n: univariate_eval_on_base(final_coefficients, alpha, n),
         )
@@ -198,7 +203,7 @@ def whir_open(
     eval_weights = eval_carry[n_rounds * 3 + 2]
     final_value = match_range(
         n_final_vars,
-        range(MAX_NUM_VARIABLES_TO_SEND_COEFFS - WHIR_SUBSEQUENT_FOLDING_FACTOR, MAX_NUM_VARIABLES_TO_SEND_COEFFS + 1),
+        range(MIN_FINAL_WHIR_VARS, MAX_FINAL_WHIR_VARS + 1),
         lambda n: eval_multilinear_coeffs_rev(final_coefficients, all_folding_randomness[n_rounds + 1], n),
     )
     # copy_ef(mul_extension_ret(eval_weights, final_value), end_sum);
@@ -288,42 +293,28 @@ def sumcheck_verify_with_grinding(prev_fs, n_steps, prev_claimed_sum, degree: Co
 @inline
 def decompose_and_verify_merkle_batch(num_queries, sampled, root, height, num_chunks, stir_points, answers):
     debug_assert(height < 25)
-    match_range(
-        height,
-        range(5, 25),
-        lambda h: decompose_and_verify_merkle_batch_with_height(
-            num_queries, sampled, root, h, num_chunks, stir_points, answers
-        ),
-    )
+    WHIR_MERKLE_HEIGHT_DISPATCH_PLACEHOLDER
     return
 
 
 def decompose_and_verify_merkle_batch_with_height(
     num_queries, sampled, root, height: Const, num_chunks, stir_points, answers
 ):
-    if num_chunks == DIM * 2:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, DIM * 2, stir_points, answers)
+    # The first commitment contains base values; later commitments contain
+    # extension values. Their widths are fixed by this verifier's schedule.
+    if num_chunks == 2**WHIR_INITIAL_FOLDING_FACTOR / DIGEST_LEN:
+        decompose_and_verify_merkle_batch_const(
+            num_queries, sampled, root, height,
+            2**WHIR_INITIAL_FOLDING_FACTOR / DIGEST_LEN, stir_points, answers
+        )
         return
-    if num_chunks == 16:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, 16, stir_points, answers)
+    if num_chunks == DIM * 2**WHIR_SUBSEQUENT_FOLDING_FACTOR / DIGEST_LEN:
+        decompose_and_verify_merkle_batch_const(
+            num_queries, sampled, root, height,
+            DIM * 2**WHIR_SUBSEQUENT_FOLDING_FACTOR / DIGEST_LEN, stir_points, answers
+        )
         return
-    if num_chunks == 8:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, 8, stir_points, answers)
-        return
-    if num_chunks == 20:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, 20, stir_points, answers)
-        return
-    if num_chunks == 1:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, 1, stir_points, answers)
-        return
-    if num_chunks == 4:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, 4, stir_points, answers)
-        return
-    if num_chunks == 5:
-        decompose_and_verify_merkle_batch_const(num_queries, sampled, root, height, 5, stir_points, answers)
-        return
-    print(num_chunks)
-    assert False, "decompose_and_verify_merkle_batch called with unsupported num_chunks"
+    assert False, "unsupported leaf width for the selected WHIR schedule"
 
 
 def decompose_and_verify_merkle_batch_const(
@@ -331,9 +322,14 @@ def decompose_and_verify_merkle_batch_const(
 ):
     leaf_iv = build_iv(num_chunks * DIGEST_LEN)
     for i in range(0, num_queries):
-        merkle_leaves[i], stir_points[i] = decompose_and_verify_merkle_query(
-            sampled[i], height, root, num_chunks, leaf_iv
-        )
+        if height < 5:
+            merkle_leaves[i], stir_points[i] = decompose_and_verify_merkle_query_small(
+                sampled[i], height, root, num_chunks, leaf_iv
+            )
+        else:
+            merkle_leaves[i], stir_points[i] = decompose_and_verify_merkle_query(
+                sampled[i], height, root, num_chunks, leaf_iv
+            )
     return
 
 
@@ -423,7 +419,7 @@ def whir_round(
     fs = fs_duplex(fs)
     fs, combination_randomness_gen = fs_sample_ef(fs)
 
-    combination_randomness_powers = powers(combination_randomness_gen, num_queries + num_ood)
+    combination_randomness_powers = whir_continuation_powers(combination_randomness_gen, num_queries + num_ood)
 
     claimed_sum_0 = Array(DIM)
     dot_product_ee_dynamic(ood_evals, combination_randomness_powers, claimed_sum_0, num_ood)
@@ -444,6 +440,13 @@ def whir_round(
         combination_randomness_powers,
         final_sum,
     )
+
+
+@inline
+def whir_continuation_powers(gamma, num_constraints):
+    # Coefficient one belongs to the carried sumcheck claim.
+    coefficients = powers(gamma, num_constraints + 1)
+    return coefficients + DIM
 
 
 @inline
@@ -512,13 +515,14 @@ def get_num_queries(log_inv_rate, n_vars):
 def get_num_queries_const_rate(log_inv_rate: Const, n_vars):
     res = match_range(
         n_vars,
-        range(MIN_STACKED_N_VARS, TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - log_inv_rate + 1),
-        lambda nv: get_num_queries_const(log_inv_rate, nv),
+        range(MIN_STACKED_N_VARS, MAX_STACKED_N_VARS_BY_RATE[log_inv_rate - MIN_WHIR_LOG_INV_RATE] + 1),
+        lambda nv: get_num_queries_const(log_inv_rate, nv, n_vars),
     )
     return res
 
 
-def get_num_queries_const(log_inv_rate: Const, n_vars: Const):
+def get_num_queries_const(log_inv_rate: Const, n_vars: Const, observed_n_vars):
+    assert observed_n_vars == n_vars * WHIR_VALID_DIMENSIONS[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS]
     max = len(WHIR_ALL_POTENTIAL_NUM_QUERIES[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS])
     num_queries = Array(max)
     for i in unroll(0, max):
@@ -541,13 +545,14 @@ def get_query_grinding_bits(log_inv_rate, n_vars):
 def get_query_grinding_bits_const_rate(log_inv_rate: Const, n_vars):
     res = match_range(
         n_vars,
-        range(MIN_STACKED_N_VARS, TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - log_inv_rate + 1),
-        lambda nv: get_query_grinding_bits_const(log_inv_rate, nv),
+        range(MIN_STACKED_N_VARS, MAX_STACKED_N_VARS_BY_RATE[log_inv_rate - MIN_WHIR_LOG_INV_RATE] + 1),
+        lambda nv: get_query_grinding_bits_const(log_inv_rate, nv, n_vars),
     )
     return res
 
 
-def get_query_grinding_bits_const(log_inv_rate: Const, n_vars: Const):
+def get_query_grinding_bits_const(log_inv_rate: Const, n_vars: Const, observed_n_vars):
+    assert observed_n_vars == n_vars * WHIR_VALID_DIMENSIONS[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS]
     max = len(WHIR_ALL_POTENTIAL_QUERY_GRINDING[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS])
     query_grinding_bits = Array(max)
     for i in unroll(0, max):
@@ -570,13 +575,14 @@ def get_folding_grinding(log_inv_rate, n_vars):
 def get_folding_grinding_const_rate(log_inv_rate: Const, n_vars):
     res = match_range(
         n_vars,
-        range(MIN_STACKED_N_VARS, TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - log_inv_rate + 1),
-        lambda nv: get_folding_grinding_const(log_inv_rate, nv),
+        range(MIN_STACKED_N_VARS, MAX_STACKED_N_VARS_BY_RATE[log_inv_rate - MIN_WHIR_LOG_INV_RATE] + 1),
+        lambda nv: get_folding_grinding_const(log_inv_rate, nv, n_vars),
     )
     return res
 
 
-def get_folding_grinding_const(log_inv_rate: Const, n_vars: Const):
+def get_folding_grinding_const(log_inv_rate: Const, n_vars: Const, observed_n_vars):
+    assert observed_n_vars == n_vars * WHIR_VALID_DIMENSIONS[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS]
     max = len(WHIR_ALL_POTENTIAL_FOLDING_GRINDING[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS])
     folding_grinding = Array(max)
     for i in unroll(0, max):
@@ -598,13 +604,14 @@ def get_num_oods(log_inv_rate, n_vars):
 def get_num_oods_const_rate(log_inv_rate: Const, n_vars):
     res = match_range(
         n_vars,
-        range(MIN_STACKED_N_VARS, TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - log_inv_rate + 1),
-        lambda nv: get_num_oods_const(log_inv_rate, nv),
+        range(MIN_STACKED_N_VARS, MAX_STACKED_N_VARS_BY_RATE[log_inv_rate - MIN_WHIR_LOG_INV_RATE] + 1),
+        lambda nv: get_num_oods_const(log_inv_rate, nv, n_vars),
     )
     return res
 
 
-def get_num_oods_const(log_inv_rate: Const, n_vars: Const):
+def get_num_oods_const(log_inv_rate: Const, n_vars: Const, observed_n_vars):
+    assert observed_n_vars == n_vars * WHIR_VALID_DIMENSIONS[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS]
     max = len(WHIR_ALL_POTENTIAL_NUM_OODS[log_inv_rate - MIN_WHIR_LOG_INV_RATE][n_vars - MIN_STACKED_N_VARS])
     num_oods = Array(max)
     for i in unroll(0, max):

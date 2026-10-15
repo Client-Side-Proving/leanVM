@@ -75,6 +75,95 @@ impl<'a, EF: KoalaBearExtension> LayerStorage<'a, EF> {
         }
     }
 
+    pub(super) fn sum_quotients_4_by_4(&self, packing_log_width: usize) -> Self {
+        match self {
+            Self::Initial { nums, dens, chunk_log } if *chunk_log > packing_log_width + 1 => {
+                let (new_nums, new_dens) =
+                    sum_quotients_4_by_4_packed_br::<EF, _>(nums.as_ref(), dens.as_ref(), *chunk_log);
+                Self::PackedBr {
+                    nums: ArenaCow::Owned(new_nums),
+                    dens: ArenaCow::Owned(new_dens),
+                    chunk_log: *chunk_log - 2,
+                }
+            }
+            Self::PackedBr { nums, dens, chunk_log } if *chunk_log > packing_log_width + 1 => {
+                let (new_nums, new_dens) =
+                    sum_quotients_4_by_4_packed_br::<EF, _>(nums.as_ref(), dens.as_ref(), *chunk_log);
+                Self::PackedBr {
+                    nums: ArenaCow::Owned(new_nums),
+                    dens: ArenaCow::Owned(new_dens),
+                    chunk_log: *chunk_log - 2,
+                }
+            }
+            Self::Natural { nums, dens } => {
+                let (new_nums, new_dens) = sum_quotients_4_by_4(nums.as_ref(), dens.as_ref());
+                Self::Natural {
+                    nums: ArenaCow::Owned(new_nums),
+                    dens: ArenaCow::Owned(new_dens),
+                }
+            }
+            _ => {
+                let first = if self.chunk_log() == packing_log_width {
+                    self.convert_to_natural().sum_quotients_2_by_2()
+                } else {
+                    self.sum_quotients_2_by_2()
+                };
+                if first.chunk_log() == packing_log_width {
+                    first.convert_to_natural().sum_quotients_2_by_2()
+                } else {
+                    first.sum_quotients_2_by_2()
+                }
+            }
+        }
+    }
+
+    pub(super) fn sum_quotients_2_by_2_reusing(&self, output: &mut Self) {
+        match (self, output) {
+            (
+                Self::Initial { nums, dens, chunk_log },
+                Self::PackedBr {
+                    nums: ArenaCow::Owned(new_nums),
+                    dens: ArenaCow::Owned(new_dens),
+                    chunk_log: new_chunk_log,
+                },
+            ) => {
+                sum_quotients_2_by_2_packed_br_into::<EF, _>(
+                    nums.as_ref(),
+                    dens.as_ref(),
+                    *chunk_log,
+                    new_nums,
+                    new_dens,
+                );
+                *new_chunk_log = *chunk_log - 1;
+            }
+            (
+                Self::PackedBr { nums, dens, chunk_log },
+                Self::PackedBr {
+                    nums: ArenaCow::Owned(new_nums),
+                    dens: ArenaCow::Owned(new_dens),
+                    chunk_log: new_chunk_log,
+                },
+            ) => {
+                sum_quotients_2_by_2_packed_br_into::<EF, _>(
+                    nums.as_ref(),
+                    dens.as_ref(),
+                    *chunk_log,
+                    new_nums,
+                    new_dens,
+                );
+                *new_chunk_log = *chunk_log - 1;
+            }
+            (
+                Self::Natural { nums, dens },
+                Self::Natural {
+                    nums: ArenaCow::Owned(new_nums),
+                    dens: ArenaCow::Owned(new_dens),
+                },
+            ) => sum_quotients_2_by_2_into(nums.as_ref(), dens.as_ref(), new_nums, new_dens),
+            (_, output) => *output = self.sum_quotients_2_by_2(),
+        }
+    }
+
     pub(super) fn chunk_log(&self) -> usize {
         match self {
             Self::Initial { chunk_log, .. } => *chunk_log,
@@ -97,6 +186,11 @@ impl<'a, EF: KoalaBearExtension> LayerStorage<'a, EF> {
         n.resize(full, EF::ZERO);
         d.resize(full, EF::ONE);
         (n, d)
+    }
+
+    pub fn materialise_in_full_ref(&self) -> (ArenaVec<EF>, ArenaVec<EF>) {
+        let natural = self.convert_to_natural();
+        natural.materialise_in_full()
     }
 }
 
@@ -150,6 +244,66 @@ fn sum_quotients_2_by_2<EF: KoalaBearExtension>(nums: &[EF], dens: &[EF]) -> (Ar
     (new_nums, new_dens)
 }
 
+fn sum_quotients_4_by_4<EF: KoalaBearExtension>(nums: &[EF], dens: &[EF]) -> (ArenaVec<EF>, ArenaVec<EF>) {
+    assert_eq!(nums.len(), dens.len());
+    let new_active = nums.len().div_ceil(4);
+    let mut new_nums: ArenaVec<EF> = unsafe { ArenaVec::uninitialized(new_active) };
+    let mut new_dens: ArenaVec<EF> = unsafe { ArenaVec::uninitialized(new_active) };
+
+    parallel::par_for_each_mut2(&mut new_nums, &mut new_dens, |i, num, den| {
+        let get = |j: usize| {
+            (
+                nums.get(j).copied().unwrap_or(EF::ZERO),
+                dens.get(j).copied().unwrap_or(EF::ONE),
+            )
+        };
+        let (n0, d0) = get(4 * i);
+        let (n1, d1) = get(4 * i + 1);
+        let (n2, d2) = get(4 * i + 2);
+        let (n3, d3) = get(4 * i + 3);
+        let n01 = d1 * n0 + d0 * n1;
+        let d01 = d0 * d1;
+        let n23 = d3 * n2 + d2 * n3;
+        let d23 = d2 * d3;
+        *num = d23 * n01 + d01 * n23;
+        *den = d01 * d23;
+    });
+
+    (new_nums, new_dens)
+}
+
+fn sum_quotients_2_by_2_into<EF: KoalaBearExtension>(
+    nums: &[EF],
+    dens: &[EF],
+    new_nums: &mut ArenaVec<EF>,
+    new_dens: &mut ArenaVec<EF>,
+) {
+    assert_eq!(nums.len(), dens.len());
+    let active_len = nums.len();
+    let new_active = active_len.div_ceil(2);
+    let full_pairs = active_len / 2;
+    new_nums.resize(new_active, EF::ZERO);
+    new_dens.resize(new_active, EF::ONE);
+
+    parallel::par_for_each_mut2(
+        &mut new_nums[..full_pairs],
+        &mut new_dens[..full_pairs],
+        |i, num, den| {
+            let n0 = nums[2 * i];
+            let n1 = nums[2 * i + 1];
+            let d0 = dens[2 * i];
+            let d1 = dens[2 * i + 1];
+            *num = d1 * n0 + d0 * n1;
+            *den = d0 * d1;
+        },
+    );
+
+    if full_pairs < new_active {
+        new_nums[full_pairs] = nums[2 * full_pairs];
+        new_dens[full_pairs] = dens[2 * full_pairs];
+    }
+}
+
 fn sum_quotients_2_by_2_packed_br<EF: KoalaBearExtension, N>(
     nums: &[N],
     dens: &[EFPacking<EF>],
@@ -180,6 +334,80 @@ where
     });
 
     (new_nums, new_dens)
+}
+
+fn sum_quotients_4_by_4_packed_br<EF: KoalaBearExtension, N>(
+    nums: &[N],
+    dens: &[EFPacking<EF>],
+    chunk_log: usize,
+) -> (ArenaVec<EFPacking<EF>>, ArenaVec<EFPacking<EF>>)
+where
+    N: Copy + Send + Sync,
+    EFPacking<EF>: Algebra<N>,
+{
+    let w = packing_log_width::<EF>();
+    debug_assert!(chunk_log > w + 1);
+    debug_assert_eq!(nums.len(), dens.len());
+    debug_assert!(nums.len().is_multiple_of(4));
+
+    let first_bit = chunk_log - 1 - w;
+    let second_bit = first_bit - 1;
+    let pair_indices = |index: usize, bit: usize| {
+        let stride = 1usize << bit;
+        let low_mask = stride - 1;
+        let high = index >> bit;
+        let low = index & low_mask;
+        let first = (high << (bit + 1)) | low;
+        (first, first | stride)
+    };
+
+    let new_len = nums.len() >> 2;
+    let mut new_nums: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(new_len) };
+    let mut new_dens: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(new_len) };
+    parallel::par_for_each_mut2(&mut new_nums, &mut new_dens, |j, num, den| {
+        let (pair0, pair1) = pair_indices(j, second_bit);
+        let (i0, i1) = pair_indices(pair0, first_bit);
+        let (i2, i3) = pair_indices(pair1, first_bit);
+        let n01 = dens[i1] * nums[i0] + dens[i0] * nums[i1];
+        let d01 = dens[i0] * dens[i1];
+        let n23 = dens[i3] * nums[i2] + dens[i2] * nums[i3];
+        let d23 = dens[i2] * dens[i3];
+        *num = d23 * n01 + d01 * n23;
+        *den = d01 * d23;
+    });
+
+    (new_nums, new_dens)
+}
+
+fn sum_quotients_2_by_2_packed_br_into<EF: KoalaBearExtension, N>(
+    nums: &[N],
+    dens: &[EFPacking<EF>],
+    chunk_log: usize,
+    new_nums: &mut ArenaVec<EFPacking<EF>>,
+    new_dens: &mut ArenaVec<EFPacking<EF>>,
+) where
+    N: Copy + Send + Sync,
+    EFPacking<EF>: Algebra<N>,
+{
+    let w = packing_log_width::<EF>();
+    debug_assert!(chunk_log > w);
+    debug_assert_eq!(nums.len(), dens.len());
+
+    let bit = chunk_log - 1 - w;
+    let stride = 1usize << bit;
+    let lo_mask = stride - 1;
+    let new_len = nums.len() >> 1;
+    new_nums.resize(new_len, EFPacking::<EF>::ZERO);
+    new_dens.resize(new_len, EFPacking::<EF>::ONE);
+
+    parallel::par_for_each_mut2(new_nums, new_dens, |new_j, num_out, den_out| {
+        let i_hi = new_j >> bit;
+        let i_lo = new_j & lo_mask;
+        let i0 = (i_hi << (bit + 1)) | i_lo;
+        let i1 = i0 | stride;
+        *num_out = dens[i1] * nums[i0] + dens[i0] * nums[i1];
+        *den_out = dens[i0] * dens[i1];
+    });
 }
 
 pub(super) fn unpack_and_unreverse_active<EF: KoalaBearExtension>(

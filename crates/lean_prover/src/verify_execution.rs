@@ -17,15 +17,196 @@ pub fn verify_execution(
     public_input: &[F; PUBLIC_INPUT_LEN],
     proof: Proof<F>,
 ) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    verify_execution_inner(
+        bytecode,
+        public_input,
+        proof,
+        None,
+        ProofHashProfile::Poseidon1,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Verify against an application-selected profile, never one selected by the proof.
+pub fn verify_execution_with_profile(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: &WhirExecutionProfile,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    verify_execution_with_profile_and_hash(bytecode, public_input, proof, profile, ProofHashProfile::Poseidon1)
+}
+
+/// The caller supplies the expected terminal hash profile; it is never selected by the proof.
+pub fn verify_execution_with_profile_and_hash(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: &WhirExecutionProfile,
+    hash_profile: ProofHashProfile,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    verify_execution_with_profile_hash_and_public_memory(bytecode, public_input, proof, profile, hash_profile, None)
+}
+
+/// The expected program interface supplies the public region; the proof cannot select it.
+pub fn verify_execution_with_profile_hash_and_public_memory(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: &WhirExecutionProfile,
+    hash_profile: ProofHashProfile,
+    public_memory_region: Option<&PublicMemoryRegion>,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    profile
+        .validate_for_hash(hash_profile)
+        .map_err(|_| ProofError::InvalidProof)?;
+    verify_execution_inner(
+        bytecode,
+        public_input,
+        proof,
+        Some(profile),
+        hash_profile,
+        public_memory_region,
+        None,
+        false,
+    )
+}
+
+/// Verify the terminal execution and its trusted fixed-program commitment
+/// through one two-commitment WHIR continuation.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_execution_with_two_commitment_whir(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: &WhirExecutionProfile,
+    hash_profile: ProofHashProfile,
+    public_memory_region: Option<&PublicMemoryRegion>,
+    two_commitment_input: TwoCommitmentWhirVerifierInput,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    verify_execution_with_fixed_programs(
+        bytecode,
+        public_input,
+        proof,
+        profile,
+        hash_profile,
+        public_memory_region,
+        two_commitment_input,
+        false,
+    )
+}
+
+/// Verify the experimental grouped LogUp terminal mode against a trusted fixed root.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_execution_with_grouped_logup(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: &WhirExecutionProfile,
+    hash_profile: ProofHashProfile,
+    public_memory_region: Option<&PublicMemoryRegion>,
+    two_commitment_input: TwoCommitmentWhirVerifierInput,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    verify_execution_with_fixed_programs(
+        bytecode,
+        public_input,
+        proof,
+        profile,
+        hash_profile,
+        public_memory_region,
+        two_commitment_input,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_execution_with_fixed_programs(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: &WhirExecutionProfile,
+    hash_profile: ProofHashProfile,
+    public_memory_region: Option<&PublicMemoryRegion>,
+    two_commitment_input: TwoCommitmentWhirVerifierInput,
+    grouped_logup: bool,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    if grouped_logup && hash_profile != ProofHashProfile::Keccak240 {
+        return Err(ProofError::InvalidProof);
+    }
+    profile
+        .validate_for_hash(hash_profile)
+        .map_err(|_| ProofError::InvalidProof)?;
+    two_commitment_input.validate().map_err(|_| ProofError::InvalidProof)?;
+    let public_memory_region = public_memory_region.ok_or(ProofError::InvalidProof)?;
+    crate::profile::validate_two_commitment_public_memory_binding(
+        &public_memory_region.values,
+        &two_commitment_input.secondary_statements,
+        &two_commitment_input.secondary_statement_public_memory_bindings,
+    )
+    .map_err(|_| ProofError::InvalidProof)?;
+    verify_execution_inner(
+        bytecode,
+        public_input,
+        proof,
+        Some(profile),
+        hash_profile,
+        Some(public_memory_region),
+        Some(two_commitment_input),
+        grouped_logup,
+    )
+}
+
+fn verify_execution_inner(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+    profile: Option<&WhirExecutionProfile>,
+    hash_profile: ProofHashProfile,
+    public_memory_region: Option<&PublicMemoryRegion>,
+    two_commitment_input: Option<TwoCommitmentWhirVerifierInput>,
+    grouped_logup: bool,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    if let Some(region) = public_memory_region {
+        region.validate().map_err(|_| ProofError::InvalidProof)?;
+    }
     if bytecode.log_size() > MAX_BYTECODE_LOG_SIZE {
         return Err(ProofError::TooBigBytecode {
             current_log_size: bytecode.log_size(),
             max_log_size: MAX_BYTECODE_LOG_SIZE,
         });
     }
+    let cap = match (&two_commitment_input, profile) {
+        (Some(input), Some(profile)) => crate::profile::two_commitment_fiat_shamir_domain_sep(
+            profile,
+            bytecode,
+            input.secondary_num_variables,
+            input.secondary_actual_data_len,
+            &input.secondary_statements,
+            &input.secondary_statement_public_memory_bindings,
+            &input.execution_bytecode_point_prefix,
+            input.two_commitment_batching_pow_bits,
+        ),
+        (Some(_), None) => return Err(ProofError::InvalidProof),
+        (None, profile) => profile.map_or_else(
+            || fiat_shamir_domain_sep(bytecode),
+            |profile| profile.fiat_shamir_domain_sep(bytecode),
+        ),
+    };
     let mut verifier_state =
-        VerifierState::<EF, _>::new(proof, get_poseidon16().clone(), fiat_shamir_domain_sep(bytecode))?;
+        VerifierState::<EF, _>::new_with_hash_profile(proof, get_poseidon16().clone(), cap, hash_profile)?;
+    if grouped_logup {
+        verifier_state.observe_scalars(&crate::grouped_logup_mode_observation());
+    }
     verifier_state.observe_scalars(public_input);
+    if let Some(region) = public_memory_region {
+        verifier_state.observe_scalars(&region.transcript_header());
+        verifier_state.observe_scalars(&region.values);
+    }
+    if let Some(input) = &two_commitment_input {
+        verifier_state.observe_scalars(&two_commitment_statement_observation(&input.secondary_statements));
+    }
     let dims = verifier_state
         .next_base_scalars_vec(2 + N_TABLES)?
         .into_iter()
@@ -34,8 +215,14 @@ pub fn verify_execution(
     let log_inv_rate = dims[0];
     let log_memory = dims[1];
     let table_n_vars: BTreeMap<Table, VarCount> = (0..N_TABLES).map(|i| (ALL_TABLES[i], dims[i + 2])).collect();
-    check_rate(log_inv_rate)?;
-    let whir_config = default_whir_config(log_inv_rate);
+    if let Some(profile) = profile {
+        if profile.log_inv_rate != log_inv_rate {
+            return Err(ProofError::InvalidProof);
+        }
+    } else {
+        check_rate(log_inv_rate)?;
+    }
+    let whir_config = profile.map_or_else(|| default_whir_config(log_inv_rate), WhirExecutionProfile::whir_config);
     for (table, &log_n_rows) in &table_n_vars {
         if log_n_rows < MIN_LOG_N_ROWS_PER_TABLE {
             return Err(ProofError::InvalidProof);
@@ -58,23 +245,82 @@ pub fn verify_execution(
     if !(MIN_LOG_MEMORY_SIZE..=MAX_LOG_MEMORY_SIZE).contains(&log_memory) {
         return Err(ProofError::InvalidProof);
     }
+    if let Some(region) = public_memory_region {
+        region
+            .validate_for_memory_len(1usize << log_memory)
+            .map_err(|_| ProofError::InvalidProof)?;
+    }
 
     if bytecode.log_size() < MIN_BYTECODE_LOG_SIZE {
         return Err(ProofError::InvalidProof);
     }
 
-    let parsed_commitment = stacked_pcs_parse_commitment(
-        &whir_config,
-        &mut verifier_state,
-        log_memory,
-        bytecode.log_size(),
-        &table_n_vars,
-    )?;
+    if let Some(profile) = profile {
+        let max_height = table_n_vars.values().copied().max().unwrap().max(bytecode.log_size());
+        let entries = 2 * (1 << log_memory)
+            + (1 << max_height)
+            + table_n_vars
+                .iter()
+                .map(|(table, height)| table.n_columns() * (1 << height))
+                .sum::<usize>();
+        profile
+            .validate_for_n_vars(log2_ceil_usize(entries))
+            .map_err(|_| ProofError::InvalidProof)?;
+    }
+    let (parsed_commitment, secondary_commitment) = if let Some(input) = &two_commitment_input {
+        let parsed_commitment = stacked_pcs_parse_commitment_without_ood(
+            &whir_config,
+            &mut verifier_state,
+            log_memory,
+            bytecode.log_size(),
+            &table_n_vars,
+        )?;
+        if parsed_commitment.num_variables != input.secondary_num_variables {
+            return Err(ProofError::InvalidProof);
+        }
+        let secondary_commitment = WhirConfig::new(&whir_config, input.secondary_num_variables)
+            .parse_commitment_without_ood::<F>(&mut verifier_state)?;
+        if secondary_commitment.root != input.expected_secondary_root {
+            return Err(ProofError::InvalidProof);
+        }
+        (parsed_commitment, Some(secondary_commitment))
+    } else {
+        (
+            stacked_pcs_parse_commitment(
+                &whir_config,
+                &mut verifier_state,
+                log_memory,
+                bytecode.log_size(),
+                &table_n_vars,
+            )?,
+            None,
+        )
+    };
 
     let logup_c = verifier_state.sample();
     verifier_state.duplex();
     let logup_alphas = verifier_state.sample_vec(LOG_MAX_BUS_WIDTH);
     let logup_alphas_eq_poly = eval_eq_sequential(&logup_alphas);
+
+    if grouped_logup {
+        let whir = WhirConfig::new(&whir_config, parsed_commitment.num_variables);
+        let details = crate::grouped_execution::verify_grouped_tail(
+            &mut verifier_state,
+            &whir,
+            parsed_commitment,
+            secondary_commitment.ok_or(ProofError::InvalidProof)?,
+            two_commitment_input.ok_or(ProofError::InvalidProof)?,
+            bytecode,
+            public_input,
+            public_memory_region,
+            log_memory,
+            &table_n_vars,
+            logup_c,
+            &logup_alphas,
+        )?;
+        verifier_state.check_fully_consumed()?;
+        return Ok((details, verifier_state.into_raw_proof()));
+    }
 
     let logup_statements = verify_generic_logup(
         &mut verifier_state,
@@ -173,7 +419,7 @@ pub fn verify_execution(
     let public_memory_random_point = MultilinearPoint(verifier_state.sample_vec(log2_strict_usize(public_input.len())));
     let public_memory_eval = public_input.evaluate(&public_memory_random_point);
 
-    let previous_statements = vec![
+    let mut previous_statements = vec![
         SparseStatement::new(
             parsed_commitment.num_variables,
             logup_statements.memory_and_acc_point,
@@ -197,6 +443,16 @@ pub fn verify_execution(
         ),
     ];
 
+    if let Some(region) = public_memory_region {
+        let point = MultilinearPoint(verifier_state.sample_vec(region.num_variables()));
+        let value = region.values.evaluate(&point);
+        previous_statements.push(SparseStatement::new(
+            parsed_commitment.num_variables,
+            point,
+            vec![SparseValue::new(region.selector(), value)],
+        ));
+    }
+
     let global_statements_base = stacked_pcs_global_statements(
         parsed_commitment.num_variables,
         log_memory,
@@ -209,13 +465,37 @@ pub fn verify_execution(
 
     // sanity check (not necessary for soundness)
     let num_whir_statements = global_statements_base.iter().map(|s| s.values.len()).sum::<usize>();
-    assert_eq!(num_whir_statements, total_whir_statements());
+    assert_eq!(
+        num_whir_statements,
+        total_whir_statements() + usize::from(public_memory_region.is_some())
+    );
 
-    WhirConfig::new(&whir_config, parsed_commitment.num_variables).verify(
-        &mut verifier_state,
-        &parsed_commitment,
-        global_statements_base,
-    )?;
+    let whir = WhirConfig::new(&whir_config, parsed_commitment.num_variables);
+    if let (Some(mut input), Some(secondary_commitment)) = (two_commitment_input, secondary_commitment) {
+        let bytecode_evaluation = logup_statements
+            .bytecode_evaluation
+            .as_ref()
+            .ok_or(ProofError::InvalidProof)?;
+        let mut point = std::mem::take(&mut input.execution_bytecode_point_prefix);
+        point.extend_from_slice(&bytecode_evaluation.point.0);
+        if point.len() != parsed_commitment.num_variables {
+            return Err(ProofError::InvalidProof);
+        }
+        input.secondary_statements.push(SparseStatement::dense(
+            MultilinearPoint(point),
+            bytecode_evaluation.value,
+        ));
+        whir.verify_two_commitments::<F>(
+            &mut verifier_state,
+            input.two_commitment_batching_pow_bits,
+            &parsed_commitment,
+            global_statements_base,
+            &secondary_commitment,
+            input.secondary_statements,
+        )?;
+    } else {
+        whir.verify(&mut verifier_state, &parsed_commitment, global_statements_base)?;
+    }
 
     let sorted_table_perm: Vec<usize> = sort_tables_by_height(&table_n_vars)
         .into_iter()

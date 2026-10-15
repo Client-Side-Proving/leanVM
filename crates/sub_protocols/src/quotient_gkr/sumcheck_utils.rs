@@ -178,6 +178,483 @@ pub(super) fn quotient_sumcheck_prove_packed_br_base<EF: KoalaBearExtension>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn quotient_sumcheck_prove_packed_br_base_in_place<EF: KoalaBearExtension>(
+    prover_state: &mut impl FSProver<EF>,
+    packed_nums: &[PFPacking<EF>],
+    mut packed_dens: ArenaVec<EFPacking<EF>>,
+    parent_chunk_log: usize,
+    eq_point: &[EF],
+    alpha: EF,
+    expected_sum: EF,
+) -> (Vec<EF>, [EF; 4]) {
+    let w = packing_log_width::<EF>();
+    debug_assert!(parent_chunk_log >= w + 3);
+    debug_assert_eq!(packed_nums.len(), packed_dens.len());
+    let active_chunks = (packed_nums.len() << w) >> parent_chunk_log;
+
+    let k = eq_point.len();
+    let mut remaining_eq = eq_point.to_vec();
+    let head_len = (k + 1).saturating_sub(parent_chunk_log);
+    let mut q_natural = vec![];
+    let mut mmf = EF::ONE;
+    let mut sum = expected_sum;
+
+    let outer_point = remaining_eq[..head_len].to_vec();
+    let eq_outer: ArenaVec<EF> = eval_eq(&outer_point);
+    let padding_sum = alpha * mle_of_zeros_then_ones(active_chunks, &outer_point);
+
+    let eq_alpha_0 = *remaining_eq.last().unwrap();
+    let eq_within_0: ArenaVec<_> = eval_eq_packed(&within_pt(&remaining_eq, head_len));
+    let coeffs_0 = compute_round_packed::<EF, _>(packed_nums, &packed_dens, parent_chunk_log, &eq_outer, &eq_within_0);
+    let r0 = finalize_round(
+        prover_state,
+        coeffs_0,
+        alpha,
+        eq_alpha_0,
+        &mut sum,
+        &mut mmf,
+        padding_sum,
+    );
+    q_natural.push(r0);
+    remaining_eq.pop();
+
+    let eq_alpha_1 = *remaining_eq.last().unwrap();
+    let eq_within_1: ArenaVec<_> = eval_eq_packed(&within_pt(&remaining_eq, head_len));
+    #[cfg(debug_assertions)]
+    let reference_fold = fold_and_compute_round_packed::<EF, _>(
+        packed_nums,
+        &packed_dens,
+        parent_chunk_log,
+        r0,
+        &eq_outer,
+        &eq_within_1,
+    );
+    fold_initial_into_denominator::<EF>(packed_nums, &mut packed_dens, parent_chunk_log, r0);
+    let mut folds = 1;
+    let coeffs_1 = compute_round_virtual_pairs::<EF>(&packed_dens, parent_chunk_log, folds, &eq_outer, &eq_within_1);
+    #[cfg(debug_assertions)]
+    {
+        let first_fold_bit = parent_chunk_log - 2 - packing_log_width::<EF>();
+        for i in 0..reference_fold.0.len() {
+            let (num, den) = virtual_pair::<EF>(&packed_dens, first_fold_bit, folds, i);
+            assert_eq!(num, reference_fold.0[i]);
+            assert_eq!(den, reference_fold.1[i]);
+        }
+        assert_eq!(coeffs_1.c0_den, reference_fold.2.c0_den);
+        assert_eq!(coeffs_1.c2_den, reference_fold.2.c2_den);
+        assert_eq!(coeffs_1.c0_num, reference_fold.2.c0_num);
+        assert_eq!(coeffs_1.c2_num, reference_fold.2.c2_num);
+    }
+    let r1 = finalize_round(
+        prover_state,
+        coeffs_1,
+        alpha,
+        eq_alpha_1,
+        &mut sum,
+        &mut mmf,
+        padding_sum,
+    );
+    q_natural.push(r1);
+    remaining_eq.pop();
+
+    run_phase1_sumcheck_virtual_pairs(
+        prover_state,
+        &mut packed_dens,
+        parent_chunk_log,
+        &mut folds,
+        remaining_eq,
+        q_natural,
+        alpha,
+        sum,
+        mmf,
+        eq_outer,
+        r1,
+    )
+}
+
+fn pair_indices(index: usize, bit: usize) -> (usize, usize) {
+    let stride = 1usize << bit;
+    let low_mask = stride - 1;
+    let high = index >> bit;
+    let low = index & low_mask;
+    let first = (high << (bit + 1)) | low;
+    (first, first | stride)
+}
+
+fn virtual_pair_positions(index: usize, first_fold_bit: usize, folds: usize) -> (usize, usize) {
+    debug_assert!(folds > 0 && folds <= first_fold_bit + 1);
+    let mut physical = index;
+    for bit in first_fold_bit + 1 - folds..=first_fold_bit {
+        physical = pair_indices(physical, bit).0;
+    }
+    (physical, physical | (1 << first_fold_bit))
+}
+
+fn fold_initial_into_denominator<EF: KoalaBearExtension>(
+    nums: &[PFPacking<EF>],
+    dens: &mut [EFPacking<EF>],
+    parent_chunk_log: usize,
+    challenge: EF,
+) {
+    let first_fold_bit = parent_chunk_log - 2 - packing_log_width::<EF>();
+    let challenge_packed = EFPacking::<EF>::from(challenge);
+    let ptr = parallel::SendPtr(dens.as_mut_ptr());
+    parallel::for_each_index(nums.len() / 2, |j| {
+        let (i0, i1) = pair_indices(j, first_fold_bit);
+        let den0 = unsafe { *ptr.add(i0) };
+        let den1 = unsafe { *ptr.add(i1) };
+        let num = challenge_packed * (nums[i1] - nums[i0]) + nums[i0];
+        let den = den0 + (den1 - den0) * challenge;
+        unsafe {
+            ptr.add(i0).write(num);
+            ptr.add(i1).write(den);
+        }
+    });
+}
+
+fn virtual_pair<EF: KoalaBearExtension>(
+    storage: &[EFPacking<EF>],
+    first_fold_bit: usize,
+    folds: usize,
+    index: usize,
+) -> (EFPacking<EF>, EFPacking<EF>) {
+    let (num, den) = virtual_pair_positions(index, first_fold_bit, folds);
+    (storage[num], storage[den])
+}
+
+fn compute_round_virtual_pairs<EF: KoalaBearExtension>(
+    storage: &[EFPacking<EF>],
+    parent_chunk_log: usize,
+    folds: usize,
+    eq_outer: &[EF],
+    eq_within: &[EFPacking<EF>],
+) -> RoundCoeffs<EFPacking<EF>> {
+    let w = packing_log_width::<EF>();
+    let layer_chunk_log = parent_chunk_log - folds;
+    let layer_packed = 1usize << (layer_chunk_log - w);
+    let half = layer_packed / 2;
+    let quarter = layer_packed / 4;
+    let virtual_len = storage.len() >> folds;
+    debug_assert!(virtual_len.is_multiple_of(layer_packed));
+    debug_assert_eq!(eq_within.len(), quarter);
+    let first_fold_bit = parent_chunk_log - 2 - w;
+
+    parallel::map_reduce(
+        virtual_len / layer_packed,
+        RoundCoeffs::zero,
+        |chunk| {
+            let base = chunk * layer_packed;
+            let eq_o = eq_outer.get(chunk).copied().unwrap_or(EF::ONE);
+            let mut local = RoundCoeffs::<EFPacking<EF>>::zero();
+            for (inner, &eq) in eq_within.iter().enumerate() {
+                let (n00, d00) = virtual_pair::<EF>(storage, first_fold_bit, folds, base + inner);
+                let (n01, d01) = virtual_pair::<EF>(storage, first_fold_bit, folds, base + inner + quarter);
+                let (n10, d10) = virtual_pair::<EF>(storage, first_fold_bit, folds, base + inner + half);
+                let (n11, d11) = virtual_pair::<EF>(storage, first_fold_bit, folds, base + inner + half + quarter);
+                local +=
+                    pair_coeffs::<EFPacking<EF>, EFPacking<EF>>((n00, n01), (n10, n11), (d00, d01), (d10, d11)) * eq;
+            }
+            local * eq_o
+        },
+        Add::add,
+    )
+}
+
+fn fold_virtual_pairs_in_place<EF: KoalaBearExtension>(
+    storage: &mut [EFPacking<EF>],
+    parent_chunk_log: usize,
+    folds: usize,
+    challenge: EF,
+) {
+    let w = packing_log_width::<EF>();
+    let first_fold_bit = parent_chunk_log - 2 - w;
+    let current_bit = first_fold_bit - folds;
+    let current_len = storage.len() >> folds;
+    let ptr = parallel::SendPtr(storage.as_mut_ptr());
+    parallel::for_each_index(current_len / 2, |j| {
+        let (i0, i1) = pair_indices(j, current_bit);
+        let (n0_pos, d0_pos) = virtual_pair_positions(i0, first_fold_bit, folds);
+        let (n1_pos, d1_pos) = virtual_pair_positions(i1, first_fold_bit, folds);
+        let (out_n, out_d) = virtual_pair_positions(j, first_fold_bit, folds + 1);
+        let n0 = unsafe { *ptr.add(n0_pos) };
+        let d0 = unsafe { *ptr.add(d0_pos) };
+        let n1 = unsafe { *ptr.add(n1_pos) };
+        let d1 = unsafe { *ptr.add(d1_pos) };
+        unsafe {
+            ptr.add(out_n).write(n0 + (n1 - n0) * challenge);
+            ptr.add(out_d).write(d0 + (d1 - d0) * challenge);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_phase1_sumcheck_virtual_pairs<EF: KoalaBearExtension>(
+    prover_state: &mut impl FSProver<EF>,
+    storage: &mut ArenaVec<EFPacking<EF>>,
+    parent_chunk_log: usize,
+    folds: &mut usize,
+    mut remaining_eq: Vec<EF>,
+    mut q_natural: Vec<EF>,
+    alpha: EF,
+    mut sum: EF,
+    mut mmf: EF,
+    eq_outer: ArenaVec<EF>,
+    mut pending_r: EF,
+) -> (Vec<EF>, [EF; 4]) {
+    let w = packing_log_width::<EF>();
+    let mut layer_chunk_log = parent_chunk_log - *folds - 1;
+    let head_len = (remaining_eq.len() + 1).saturating_sub(layer_chunk_log);
+    let outer_point = remaining_eq[..head_len].to_vec();
+    let active_chunks = ((storage.len() >> *folds) << w) >> (layer_chunk_log + 1);
+    let padding_sum = alpha * mle_of_zeros_then_ones(active_chunks, &outer_point);
+
+    while layer_chunk_log > w + 1 && remaining_eq.len() > w + 1 {
+        let eq_alpha = *remaining_eq.last().unwrap();
+        let eq_within: ArenaVec<_> = eval_eq_packed(&within_pt(&remaining_eq, head_len));
+        fold_virtual_pairs_in_place(storage, parent_chunk_log, *folds, pending_r);
+        *folds += 1;
+        let coeffs = compute_round_virtual_pairs(storage, parent_chunk_log, *folds, &eq_outer, &eq_within);
+        let r = finalize_round(prover_state, coeffs, alpha, eq_alpha, &mut sum, &mut mmf, padding_sum);
+        pending_r = r;
+        layer_chunk_log -= 1;
+        q_natural.push(r);
+        remaining_eq.pop();
+    }
+
+    fold_virtual_pairs_in_place(storage, parent_chunk_log, *folds, pending_r);
+    *folds += 1;
+    let first_fold_bit = parent_chunk_log - 2 - w;
+    let virtual_len = storage.len() >> *folds;
+    let mut nums: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(virtual_len) };
+    let mut dens: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(virtual_len) };
+    parallel::par_for_each_mut2(&mut nums, &mut dens, |i, num, den| {
+        (*num, *den) = virtual_pair::<EF>(storage, first_fold_bit, *folds, i);
+    });
+
+    let nums_nat = unpack_and_unreverse_active::<EF>(&nums, layer_chunk_log);
+    let dens_nat = unpack_and_unreverse_active::<EF>(&dens, layer_chunk_log);
+    let (num_l, num_r) = even_odd_split(&nums_nat);
+    let (den_l, den_r) = even_odd_split(&dens_nat);
+    run_phase2_sumcheck(
+        prover_state,
+        num_l,
+        num_r,
+        den_l,
+        den_r,
+        remaining_eq,
+        q_natural,
+        alpha,
+        sum,
+        mmf,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn quotient_sumcheck_prove_reduced_initial<EF: KoalaBearExtension>(
+    prover_state: &mut impl FSProver<EF>,
+    initial_nums: &[PFPacking<EF>],
+    initial_dens: &[EFPacking<EF>],
+    initial_chunk_log: usize,
+    eq_point: &[EF],
+    alpha: EF,
+    expected_sum: EF,
+) -> (Vec<EF>, [EF; 4]) {
+    let w = packing_log_width::<EF>();
+    let layer_chunk_log = initial_chunk_log - 1;
+    debug_assert!(layer_chunk_log >= w + 3);
+    debug_assert_eq!(initial_nums.len(), initial_dens.len());
+
+    let k = eq_point.len();
+    let mut remaining_eq = eq_point.to_vec();
+    let head_len = (k + 1).saturating_sub(layer_chunk_log);
+    let mut q_natural = vec![];
+    let mut mmf = EF::ONE;
+    let mut sum = expected_sum;
+
+    let outer_point = remaining_eq[..head_len].to_vec();
+    let eq_outer: ArenaVec<EF> = eval_eq(&outer_point);
+    let active_chunks = (initial_nums.len() << (w - 1)) >> layer_chunk_log;
+    let padding_sum = alpha * mle_of_zeros_then_ones(active_chunks, &outer_point);
+
+    let eq_alpha_0 = *remaining_eq.last().unwrap();
+    let eq_within_0: ArenaVec<_> = eval_eq_packed(&within_pt(&remaining_eq, head_len));
+    let coeffs_0 =
+        compute_round_reduced_initial::<EF>(initial_nums, initial_dens, initial_chunk_log, &eq_outer, &eq_within_0);
+    let r0 = finalize_round(
+        prover_state,
+        coeffs_0,
+        alpha,
+        eq_alpha_0,
+        &mut sum,
+        &mut mmf,
+        padding_sum,
+    );
+    q_natural.push(r0);
+    remaining_eq.pop();
+
+    let eq_alpha_1 = *remaining_eq.last().unwrap();
+    let eq_within_1: ArenaVec<_> = eval_eq_packed(&within_pt(&remaining_eq, head_len));
+    let (nums_ext, dens_ext, coeffs_1) = fold_and_compute_round_reduced_initial::<EF>(
+        initial_nums,
+        initial_dens,
+        initial_chunk_log,
+        r0,
+        &eq_outer,
+        &eq_within_1,
+    );
+    let r1 = finalize_round(
+        prover_state,
+        coeffs_1,
+        alpha,
+        eq_alpha_1,
+        &mut sum,
+        &mut mmf,
+        padding_sum,
+    );
+    q_natural.push(r1);
+    remaining_eq.pop();
+
+    run_phase1_sumcheck(
+        prover_state,
+        ArenaCow::Owned(nums_ext),
+        ArenaCow::Owned(dens_ext),
+        layer_chunk_log - 2,
+        remaining_eq,
+        q_natural,
+        alpha,
+        sum,
+        mmf,
+        Some(eq_outer),
+        Some(r1),
+    )
+}
+
+#[inline(always)]
+fn reduced_initial_value<EF: KoalaBearExtension>(
+    nums: &[PFPacking<EF>],
+    dens: &[EFPacking<EF>],
+    initial_chunk_log: usize,
+    index: usize,
+) -> (EFPacking<EF>, EFPacking<EF>) {
+    let bit = initial_chunk_log - 1 - packing_log_width::<EF>();
+    let stride = 1usize << bit;
+    let low_mask = stride - 1;
+    let high = index >> bit;
+    let low = index & low_mask;
+    let i0 = (high << (bit + 1)) | low;
+    let i1 = i0 | stride;
+    (dens[i1] * nums[i0] + dens[i0] * nums[i1], dens[i0] * dens[i1])
+}
+
+fn compute_round_reduced_initial<EF: KoalaBearExtension>(
+    nums: &[PFPacking<EF>],
+    dens: &[EFPacking<EF>],
+    initial_chunk_log: usize,
+    eq_outer: &[EF],
+    eq_within: &[EFPacking<EF>],
+) -> RoundCoeffs<EFPacking<EF>> {
+    let w = packing_log_width::<EF>();
+    let layer_chunk_log = initial_chunk_log - 1;
+    let layer_packed = 1usize << (layer_chunk_log - w);
+    let half = layer_packed / 2;
+    let quarter = layer_packed / 4;
+    let reduced_len = nums.len() / 2;
+    debug_assert!(reduced_len.is_multiple_of(layer_packed));
+    debug_assert_eq!(eq_within.len(), quarter);
+
+    let n_chunks = reduced_len / layer_packed;
+    parallel::map_reduce(
+        n_chunks,
+        RoundCoeffs::zero,
+        |chunk| {
+            let base = chunk * layer_packed;
+            let eq_o = eq_outer.get(chunk).copied().unwrap_or(EF::ONE);
+            let mut local = RoundCoeffs::<EFPacking<EF>>::zero();
+            for (inner, &eq) in eq_within.iter().enumerate() {
+                let (n00, d00) = reduced_initial_value::<EF>(nums, dens, initial_chunk_log, base + inner);
+                let (n01, d01) = reduced_initial_value::<EF>(nums, dens, initial_chunk_log, base + inner + quarter);
+                let (n10, d10) = reduced_initial_value::<EF>(nums, dens, initial_chunk_log, base + inner + half);
+                let (n11, d11) =
+                    reduced_initial_value::<EF>(nums, dens, initial_chunk_log, base + inner + half + quarter);
+                local +=
+                    pair_coeffs::<EFPacking<EF>, EFPacking<EF>>((n00, n01), (n10, n11), (d00, d01), (d10, d11)) * eq;
+            }
+            local * eq_o
+        },
+        Add::add,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+fn fold_and_compute_round_reduced_initial<EF: KoalaBearExtension>(
+    nums: &[PFPacking<EF>],
+    dens: &[EFPacking<EF>],
+    initial_chunk_log: usize,
+    prev_r: EF,
+    eq_outer: &[EF],
+    eq_within: &[EFPacking<EF>],
+) -> (
+    ArenaVec<EFPacking<EF>>,
+    ArenaVec<EFPacking<EF>>,
+    RoundCoeffs<EFPacking<EF>>,
+) {
+    let w = packing_log_width::<EF>();
+    let layer_chunk_log = initial_chunk_log - 1;
+    let in_packed = 1usize << (layer_chunk_log - w);
+    let in_half = in_packed / 2;
+    let in_quarter = in_packed / 4;
+    let in_eighth = in_packed / 8;
+    let out_packed = in_packed / 2;
+    let out_half = out_packed / 2;
+    let out_quarter = out_packed / 4;
+    let reduced_len = nums.len() / 2;
+    debug_assert!(reduced_len.is_multiple_of(in_packed));
+    debug_assert_eq!(eq_within.len(), in_eighth);
+
+    let mut new_nums: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(reduced_len / 2) };
+    let mut new_dens: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(reduced_len / 2) };
+    let prev_r_packed = EFPacking::<EF>::from(prev_r);
+    let n_chunks = reduced_len / in_packed;
+    let nums_out = parallel::SendPtr(new_nums.as_mut_ptr());
+    let dens_out = parallel::SendPtr(new_dens.as_mut_ptr());
+    let coeffs = parallel::map_reduce(
+        n_chunks,
+        RoundCoeffs::zero,
+        |chunk| {
+            let input_base = chunk * in_packed;
+            let output_base = chunk * out_packed;
+            let out_nums = unsafe { nums_out.slice(output_base, out_packed) };
+            let out_dens = unsafe { dens_out.slice(output_base, out_packed) };
+            let eq_o = eq_outer.get(chunk).copied().unwrap_or(EF::ONE);
+            let mut local = RoundCoeffs::<EFPacking<EF>>::zero();
+            for i in 0..in_eighth {
+                for side in 0..2 {
+                    for quarter in 0..2 {
+                        let lo = input_base + i + side * in_half + quarter * in_eighth;
+                        let hi = lo + in_quarter;
+                        let out = i + side * out_half + quarter * out_quarter;
+                        let (num_lo, den_lo) = reduced_initial_value::<EF>(nums, dens, initial_chunk_log, lo);
+                        let (num_hi, den_hi) = reduced_initial_value::<EF>(nums, dens, initial_chunk_log, hi);
+                        out_nums[out] = prev_r_packed * (num_hi - num_lo) + num_lo;
+                        out_dens[out] = den_lo + (den_hi - den_lo) * prev_r;
+                    }
+                }
+                local += pair_coeffs::<EFPacking<EF>, EFPacking<EF>>(
+                    (out_nums[i], out_nums[i + out_quarter]),
+                    (out_nums[i + out_half], out_nums[i + out_half + out_quarter]),
+                    (out_dens[i], out_dens[i + out_quarter]),
+                    (out_dens[i + out_half], out_dens[i + out_half + out_quarter]),
+                ) * eq_within[i];
+            }
+            local * eq_o
+        },
+        Add::add,
+    );
+
+    (new_nums, new_dens, coeffs)
+}
+
 /// bit-reversed by chunk + Packed
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_phase1_sumcheck<'a, EF: KoalaBearExtension>(
@@ -227,17 +704,29 @@ pub(super) fn run_phase1_sumcheck<'a, EF: KoalaBearExtension>(
         let eq_within: ArenaVec<_> = eval_eq_packed(&within_pt(&remaining_eq, head_len));
 
         let coeffs = if let Some(prev_r) = pending_r.take() {
-            let (new_nums, new_dens, c) = fold_and_compute_round_packed::<EF, _>(
-                nums.as_ref(),
-                dens.as_ref(),
-                layer_chunk_log + 1,
-                prev_r,
-                &eq_outer,
-                &eq_within,
-            );
-            nums = ArenaCow::Owned(new_nums);
-            dens = ArenaCow::Owned(new_dens);
-            c
+            match (&mut nums, &mut dens) {
+                (ArenaCow::Owned(nums), ArenaCow::Owned(dens)) => fold_and_compute_round_packed_in_place::<EF>(
+                    nums,
+                    dens,
+                    layer_chunk_log + 1,
+                    prev_r,
+                    &eq_outer,
+                    &eq_within,
+                ),
+                _ => {
+                    let (new_nums, new_dens, c) = fold_and_compute_round_packed::<EF, _>(
+                        nums.as_ref(),
+                        dens.as_ref(),
+                        layer_chunk_log + 1,
+                        prev_r,
+                        &eq_outer,
+                        &eq_within,
+                    );
+                    nums = ArenaCow::Owned(new_nums);
+                    dens = ArenaCow::Owned(new_dens);
+                    c
+                }
+            }
         } else {
             compute_round_packed::<EF, _>(nums.as_ref(), dens.as_ref(), layer_chunk_log, &eq_outer, &eq_within)
         };
@@ -272,6 +761,53 @@ pub(super) fn run_phase1_sumcheck<'a, EF: KoalaBearExtension>(
         sum,
         mmf,
     )
+}
+
+fn fold_and_compute_round_packed_in_place<EF: KoalaBearExtension>(
+    nums: &mut ArenaVec<EFPacking<EF>>,
+    dens: &mut ArenaVec<EFPacking<EF>>,
+    layer_chunk_log_old: usize,
+    prev_r: EF,
+    eq_outer: &[EF],
+    eq_within: &[EFPacking<EF>],
+) -> RoundCoeffs<EFPacking<EF>> {
+    let w = packing_log_width::<EF>();
+    debug_assert!(layer_chunk_log_old >= w + 3);
+    let in_packed = 1usize << (layer_chunk_log_old - w);
+    let in_half = in_packed / 2;
+    let in_quarter = in_packed / 4;
+    let in_eighth = in_packed / 8;
+    let out_packed = in_packed / 2;
+    let out_half = out_packed / 2;
+    let out_quarter = out_packed / 4;
+    debug_assert!(nums.len().is_multiple_of(in_packed));
+    debug_assert_eq!(dens.len(), nums.len());
+    debug_assert_eq!(eq_within.len(), in_eighth);
+
+    let prev_r_packed = EFPacking::<EF>::from(prev_r);
+    let n_chunks = nums.len() / in_packed;
+    for chunk in 0..n_chunks {
+        let input_base = chunk * in_packed;
+        let output_base = chunk * out_packed;
+        for i in 0..in_eighth {
+            for side in 0..2 {
+                for quarter in 0..2 {
+                    let lo = input_base + i + side * in_half + quarter * in_eighth;
+                    let hi = lo + in_quarter;
+                    let out = output_base + i + side * out_half + quarter * out_quarter;
+                    let num_lo = nums[lo];
+                    let num_hi = nums[hi];
+                    let den_lo = dens[lo];
+                    let den_hi = dens[hi];
+                    nums[out] = prev_r_packed * (num_hi - num_lo) + num_lo;
+                    dens[out] = den_lo + (den_hi - den_lo) * prev_r;
+                }
+            }
+        }
+    }
+    nums.truncate(nums.len() / 2);
+    dens.truncate(dens.len() / 2);
+    compute_round_packed::<EF, _>(nums, dens, layer_chunk_log_old - 1, eq_outer, eq_within)
 }
 
 // Normal ordering (not bit-reversed) + not packed

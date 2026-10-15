@@ -42,6 +42,19 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]>> ProverState<EF, P>
         }
     }
 
+    pub fn new_with_hash_profile(
+        permutation: P,
+        capacity: [PF<EF>; CAPACITY],
+        profile: symetric::ProofHashProfile,
+    ) -> Self {
+        assert!(EF::DIMENSION <= RATE);
+        Self {
+            challenger: Challenger::new_with_hash_profile(permutation, capacity, profile),
+            transcript: Vec::new(),
+            merkle_paths: Vec::new(),
+        }
+    }
+
     pub fn into_proof(self) -> Proof<PF<EF>> {
         Proof {
             transcript: self.transcript,
@@ -63,6 +76,9 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]>> ChallengeSampler<E
 impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<EF> as Field>::Packing; WIDTH]>>
     FSProver<EF> for ProverState<EF, P>
 {
+    fn hash_profile(&self) -> symetric::ProofHashProfile {
+        self.challenger.hash_profile()
+    }
     fn add_base_scalars(&mut self, scalars: &[PF<EF>]) {
         self.challenger.observe_many(scalars);
         self.transcript.extend_from_slice(scalars);
@@ -117,6 +133,32 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<
         }
 
         let time = Instant::now();
+
+        if self.challenger.hash_profile() == symetric::ProofHashProfile::Keccak240 {
+            let next = AtomicU64::new(0);
+            let found = AtomicBool::new(false);
+            let result = Mutex::new(None);
+            parallel::for_each_index(parallel::num_threads(), |_| {
+                while !found.load(Ordering::Relaxed) {
+                    let start = next.fetch_add(64, Ordering::Relaxed);
+                    if start >= PF::<EF>::ORDER_U64 {
+                        return;
+                    }
+                    for candidate in start..(start + 64).min(PF::<EF>::ORDER_U64) {
+                        if self.challenger.check_keccak_witness(bits, candidate as u32) {
+                            *result.lock().unwrap() = Some(PF::<EF>::from_u32(candidate as u32));
+                            found.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            });
+            let witness = result.into_inner().unwrap().expect("failed to find grinding witness");
+            assert!(self.challenger.absorb_keccak_witness(bits, witness));
+            self.transcript.push(witness);
+            POW_GRINDING_NANOS.fetch_add(time.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return;
+        }
 
         type Packed<EF> = <PF<EF> as Field>::Packing;
         let lanes = Packed::<EF>::WIDTH;
@@ -173,6 +215,8 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<
         self.challenger.observe_many(&[witness]);
         assert!(self.challenger.state[CAPACITY].as_canonical_u64() & ((1 << bits) - 1) == 0);
         self.transcript.push(witness);
+        // Refresh the rate after constraining one of its words.
+        self.challenger.duplex();
 
         let elapsed = time.elapsed();
         POW_GRINDING_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);

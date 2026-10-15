@@ -110,15 +110,21 @@ pub enum CustomHint {
     LessThan,
     Log2Ceil,
     DivFloor,
+    /// Suggest whether a value occurs for the first time in a prefix.
+    IsFirstOccurrence,
+    /// Suggest indices sorted by (value, original index).
+    SortIndices,
 }
 
-pub const CUSTOM_HINTS: [CustomHint; 6] = [
+pub const CUSTOM_HINTS: [CustomHint; 8] = [
     CustomHint::DecomposeBitsXMSS,
     CustomHint::DecomposeBitsMerkleWhir,
     CustomHint::DecomposeBits,
     CustomHint::LessThan,
     CustomHint::Log2Ceil,
     CustomHint::DivFloor,
+    CustomHint::IsFirstOccurrence,
+    CustomHint::SortIndices,
 ];
 
 impl CustomHint {
@@ -130,6 +136,8 @@ impl CustomHint {
             Self::LessThan => "hint_less_than",
             Self::Log2Ceil => "hint_log2_ceil",
             Self::DivFloor => "hint_div_floor",
+            Self::IsFirstOccurrence => "hint_is_first_occurrence",
+            Self::SortIndices => "hint_sort_indices",
         }
     }
 
@@ -141,6 +149,8 @@ impl CustomHint {
             Self::LessThan => 3,
             Self::Log2Ceil => 2,
             Self::DivFloor => 4,
+            Self::IsFirstOccurrence => 4,
+            Self::SortIndices => 3,
         }
     }
 
@@ -224,6 +234,36 @@ impl CustomHint {
                 ctx.memory.set(q_ptr, F::from_usize(a / b))?;
                 ctx.memory.set(r_ptr, F::from_usize(a % b))?;
             }
+            Self::IsFirstOccurrence => {
+                let values = args[0].read_value(ctx.memory, ctx.fp)?.to_usize();
+                let length = args[1].read_value(ctx.memory, ctx.fp)?.to_usize();
+                let value = args[2].read_value(ctx.memory, ctx.fp)?;
+                let result = args[3].memory_address(ctx.fp)?;
+                validate_query_hint_span(values, length)?;
+                validate_query_hint_span(result, 1)?;
+                let mut first = true;
+                for index in 0..length {
+                    if ctx.memory.get(values + index)? == value {
+                        first = false;
+                        break;
+                    }
+                }
+                ctx.memory.set(result, F::from_bool(first))?;
+            }
+            Self::SortIndices => {
+                let values = args[0].read_value(ctx.memory, ctx.fp)?.to_usize();
+                let length = args[1].read_value(ctx.memory, ctx.fp)?.to_usize();
+                let output = args[2].read_value(ctx.memory, ctx.fp)?.to_usize();
+                validate_query_hint_span(values, length)?;
+                validate_query_hint_span(output, length)?;
+                let mut entries = (0..length)
+                    .map(|index| Ok((ctx.memory.get(values + index)?.to_usize(), index)))
+                    .collect::<Result<Vec<_>, RunnerError>>()?;
+                entries.sort_unstable();
+                for (position, (_, index)) in entries.into_iter().enumerate() {
+                    ctx.memory.set(output + position, F::from_usize(index))?;
+                }
+            }
         }
         Ok(())
     }
@@ -231,6 +271,19 @@ impl CustomHint {
     pub fn find_by_name(name: &str) -> Option<Self> {
         CUSTOM_HINTS.iter().find(|hint| hint.name() == name).copied()
     }
+}
+
+fn validate_query_hint_span(start: usize, length: usize) -> Result<(), RunnerError> {
+    if length >= 1 << 15
+        || start
+            .checked_add(length)
+            .is_none_or(|end| end > 1 << MAX_LOG_MEMORY_SIZE)
+    {
+        return Err(RunnerError::InvalidHintArguments(format!(
+            "query hint span is out of bounds: start={start}, length={length}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -505,5 +558,22 @@ impl Display for Boolean {
             Self::LessThan => write!(f, "<"),
             Self::LessOrEqual => write!(f, "<="),
         }
+    }
+}
+
+#[cfg(test)]
+mod query_hint_tests {
+    use super::*;
+
+    #[test]
+    fn query_hint_spans_are_bounded_before_allocation_or_access() {
+        let limit = 1usize << MAX_LOG_MEMORY_SIZE;
+        assert!(validate_query_hint_span(0, 32767).is_ok());
+        assert!(validate_query_hint_span(limit - 1, 1).is_ok());
+        assert!(validate_query_hint_span(limit, 0).is_ok());
+        assert!(validate_query_hint_span(0, 32768).is_err());
+        assert!(validate_query_hint_span(limit - 1, 2).is_err());
+        assert!(validate_query_hint_span(limit, 1).is_err());
+        assert!(validate_query_hint_span(usize::MAX, 1).is_err());
     }
 }

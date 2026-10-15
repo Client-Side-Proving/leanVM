@@ -12,6 +12,14 @@ Minimal hash-based zkVM, for a Post-Quantum Ethereum.
   <a href="crates/lean_prover/python-verifier/verifier.py"><img src="https://img.shields.io/badge/Python%20verifier-d97706?style=for-the-badge&logo=python&logoColor=white" alt="Python verifier"></a>
 </p>
 
+## Spartan-WHIR recursion
+
+This fork adds a Spartan-WHIR verifier guest, explicit recursive proof profiles, grouped LogUp proving, and Keccak terminal proof export. See the [guest documentation](crates/spartan_whir_guest/README.md) for fixture generation, execution, recursion, and terminal export commands.
+
+The recursive chain uses the parameters and conditional classical bounds in [Security accounting](SECURITY_ACCOUNTING.md). The [grouped derivation](GROUPED_SECURITY_DERIVATION.md) records the additional reductions and remaining extraction assumptions. Generated benchmark runs stay in the ignored `benchmark-results/` directory; the accounting scripts accept explicit report and client-constant paths.
+
+Rust uses the repository's pinned toolchain. Client and terminal fixture generation also require a sibling `spartan-whir` checkout, with this repository named `leanVM`. Pass `--upstream-ref upstream/main` to `script/run_terminal_fixture.py` when `origin` points to the fork and `upstream` tracks `leanEthereum/leanVM`.
+
 ## Proving System
 
 

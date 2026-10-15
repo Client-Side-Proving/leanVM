@@ -4,11 +4,11 @@ use crate::*;
 use crate::{execution::memory::MemoryAccess, tables::poseidon::trace_gen::generate_trace_rows_for_perm};
 use backend::*;
 
-/// For `SymbolicExpression` we use the dense form so the zkDSL generator can
-/// emit `dot_product_be` precompile calls instead of Karatsuba arithmetic.
+/// The default symbolic AIR uses dense products for zkDSL dot-product emission.
+/// The optional FFT form preserves the same linear map with fewer field operations.
 #[inline(always)]
-fn mds_air_16<A: Algebra<KoalaBear> + 'static>(state: &mut [A; WIDTH]) {
-    if TypeId::of::<A>() == TypeId::of::<SymbolicExpression<KoalaBear>>() {
+fn mds_air_16<A: Algebra<KoalaBear> + 'static, const FFT_SYMBOLIC_MDS: bool>(state: &mut [A; WIDTH]) {
+    if !FFT_SYMBOLIC_MDS && TypeId::of::<A>() == TypeId::of::<SymbolicExpression<KoalaBear>>() {
         dense_mat_vec_air_16(mds_dense_16(), state);
     } else {
         mds_fft_16(state);
@@ -80,9 +80,9 @@ pub const ALL_POSEIDON16_NAMES: [&str; 7] = [
 pub const HALF_DIGEST_LEN: usize = DIGEST_LEN / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Poseidon16Precompile<const BUS: bool>;
+pub struct Poseidon16Precompile<const BUS: bool, const FFT_SYMBOLIC_MDS: bool = false>;
 
-impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
+impl<const BUS: bool, const FFT_SYMBOLIC_MDS: bool> TableT for Poseidon16Precompile<BUS, FFT_SYMBOLIC_MDS> {
     fn name(&self) -> &'static str {
         "poseidon16"
     }
@@ -237,7 +237,7 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
     }
 }
 
-impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
+impl<const BUS: bool, const FFT_SYMBOLIC_MDS: bool> Air for Poseidon16Precompile<BUS, FFT_SYMBOLIC_MDS> {
     type ExtraData = ExtraDataForBuses<EF>;
     fn n_columns(&self) -> usize {
         num_cols_poseidon_16()
@@ -307,7 +307,7 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         builder.assert_zero(cols.flag_left * (cols.offset_left - cols.addr_left_lo));
         builder.assert_zero(one_minus_flag_left * (nu_a - cols.addr_left_lo));
 
-        eval_poseidon1_16(builder, &cols)
+        eval_poseidon1_16::<_, FFT_SYMBOLIC_MDS>(builder, &cols)
     }
 }
 
@@ -333,12 +333,12 @@ pub(super) struct Poseidon1Cols16<T> {
     pub out_hi: [T; WIDTH / 2],
 }
 
-fn eval_poseidon1_16<AB: AirBuilder>(builder: &mut AB, local: &Poseidon1Cols16<AB::IF>) {
+fn eval_poseidon1_16<AB: AirBuilder, const FFT_SYMBOLIC_MDS: bool>(builder: &mut AB, local: &Poseidon1Cols16<AB::IF>) {
     let mut state: [_; WIDTH] = local.inputs;
 
     let initial_constants = poseidon1_initial_constants();
     for round in 0..HALF_INITIAL_FULL_ROUNDS {
-        eval_2_full_rounds_16(
+        eval_2_full_rounds_16::<_, FFT_SYMBOLIC_MDS>(
             &mut state,
             &local.beginning_full_rounds[round],
             &initial_constants[2 * round],
@@ -377,7 +377,7 @@ fn eval_poseidon1_16<AB: AirBuilder>(builder: &mut AB, local: &Poseidon1Cols16<A
 
     let final_constants = poseidon1_final_constants();
     for round in 0..HALF_FINAL_FULL_ROUNDS - 1 {
-        eval_2_full_rounds_16(
+        eval_2_full_rounds_16::<_, FFT_SYMBOLIC_MDS>(
             &mut state,
             &local.ending_full_rounds[round],
             &final_constants[2 * round],
@@ -386,7 +386,7 @@ fn eval_poseidon1_16<AB: AirBuilder>(builder: &mut AB, local: &Poseidon1Cols16<A
         );
     }
 
-    eval_last_2_full_rounds_16(
+    eval_last_2_full_rounds_16::<_, FFT_SYMBOLIC_MDS>(
         &local.inputs,
         &mut state,
         &local.out_lo,
@@ -410,7 +410,7 @@ pub const fn num_cols_total_poseidon_16() -> usize {
 }
 
 #[inline]
-fn eval_2_full_rounds_16<AB: AirBuilder>(
+fn eval_2_full_rounds_16<AB: AirBuilder, const FFT_SYMBOLIC_MDS: bool>(
     state: &mut [AB::IF; WIDTH],
     post_full_round: &[AB::IF; WIDTH],
     round_constants_1: &[F; WIDTH],
@@ -421,12 +421,12 @@ fn eval_2_full_rounds_16<AB: AirBuilder>(
         *s += *r;
         *s = s.cube();
     }
-    mds_air_16(state);
+    mds_air_16::<_, FFT_SYMBOLIC_MDS>(state);
     for (s, r) in state.iter_mut().zip(round_constants_2.iter()) {
         *s += *r;
         *s = s.cube();
     }
-    mds_air_16(state);
+    mds_air_16::<_, FFT_SYMBOLIC_MDS>(state);
     for (state_i, post_i) in state.iter_mut().zip(post_full_round) {
         builder.assert_eq(*state_i, *post_i);
         *state_i = *post_i;
@@ -435,7 +435,7 @@ fn eval_2_full_rounds_16<AB: AirBuilder>(
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn eval_last_2_full_rounds_16<AB: AirBuilder>(
+fn eval_last_2_full_rounds_16<AB: AirBuilder, const FFT_SYMBOLIC_MDS: bool>(
     initial_state: &[AB::IF; WIDTH],
     state: &mut [AB::IF; WIDTH],
     out_lo: &[AB::IF; WIDTH / 2],
@@ -451,12 +451,12 @@ fn eval_last_2_full_rounds_16<AB: AirBuilder>(
         *s += *r;
         *s = s.cube();
     }
-    mds_air_16(state);
+    mds_air_16::<_, FFT_SYMBOLIC_MDS>(state);
     for (s, r) in state.iter_mut().zip(round_constants_2.iter()) {
         *s += *r;
         *s = s.cube();
     }
-    mds_air_16(state);
+    mds_air_16::<_, FFT_SYMBOLIC_MDS>(state);
     let feedforward = AB::IF::ONE - flag_permute;
     let gate_lo_8 = AB::IF::ONE - flag_out4;
     let gate_hi = AB::IF::ONE - flag_out8 - flag_out4;
@@ -493,5 +493,58 @@ fn sparse_mat_air_16<A: Algebra<KoalaBear>>(state: &mut [A; WIDTH], first_row: &
     state[0] = new_s0;
     for i in 1..WIDTH {
         state[i] += old_s0 * v[i - 1];
+    }
+}
+
+#[cfg(test)]
+mod symbolic_mds_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn evaluate(
+        expression: SymbolicExpression<F>,
+        values: &[F; WIDTH],
+        cache: &mut HashMap<SymbolicNodeRef<F>, F>,
+    ) -> F {
+        match expression {
+            SymbolicExpression::Constant(value) => value,
+            SymbolicExpression::Variable(variable) => values[variable.index],
+            SymbolicExpression::Operation(node) => {
+                if let Some(value) = cache.get(&node) {
+                    return *value;
+                }
+                let left = evaluate(node.lhs, values, cache);
+                let right = evaluate(node.rhs, values, cache);
+                let value = match node.op {
+                    SymbolicOperation::Add => left + right,
+                    SymbolicOperation::Sub => left - right,
+                    SymbolicOperation::Mul => left * right,
+                    SymbolicOperation::Neg => -left,
+                };
+                cache.insert(node, value);
+                value
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_fft_and_dense_mds_agree_on_every_basis_vector() {
+        let variables = std::array::from_fn(|index| SymbolicExpression::from(SymbolicVariable::new(index)));
+        let mut dense = variables;
+        let mut fft = variables;
+        mds_air_16::<_, false>(&mut dense);
+        mds_air_16::<_, true>(&mut fft);
+        // Both expressions are linear, so equality on zero and the full basis
+        // establishes equality for every input, including extension-field inputs.
+        for basis in 0..=WIDTH {
+            let values = std::array::from_fn(|index| if index == basis { F::ONE } else { F::ZERO });
+            let mut cache = HashMap::new();
+            for index in 0..WIDTH {
+                assert_eq!(
+                    evaluate(dense[index], &values, &mut cache),
+                    evaluate(fft[index], &values, &mut cache)
+                );
+            }
+        }
     }
 }

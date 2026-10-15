@@ -23,7 +23,10 @@ pub(crate) fn flatten_bytecode_claim(claim: &Evaluation<EF>) -> Vec<F> {
 }
 
 pub(crate) fn compute_bytecode_value_at(point: &MultilinearPoint<EF>) -> EF {
-    let bytecode = get_aggregation_bytecode();
+    compute_bytecode_value_at_for(get_aggregation_bytecode(), point)
+}
+
+pub(crate) fn compute_bytecode_value_at_for(bytecode: &Bytecode, point: &MultilinearPoint<EF>) -> EF {
     if point.iter().all(|x| x.is_zero()) {
         // fast path for multi-signatures coming from 100% raw XMSS (no recursion):
         EF::from(bytecode.instructions_multilinear()[0])
@@ -52,11 +55,24 @@ pub(crate) fn reduce_bytecode_claims(verified: &[InnerVerified]) -> ReducedBytec
         ));
         claims.push(v.bytecode_evaluation.clone());
     }
+    reduce_evaluations_for_bytecode(bytecode, &claims)
+}
+
+pub(crate) fn reduce_evaluations_for_bytecode(bytecode: &Bytecode, claims: &[Evaluation<EF>]) -> ReducedBytecodeClaims {
+    reduce_evaluations_for_bytecode_with_cap(bytecode, claims, fiat_shamir_domain_sep(bytecode))
+}
+
+pub(crate) fn reduce_evaluations_for_bytecode_with_cap(
+    bytecode: &Bytecode,
+    claims: &[Evaluation<EF>],
+    initial_cap: [F; DIGEST_LEN],
+) -> ReducedBytecodeClaims {
+    assert!(!claims.is_empty(), "bytecode claim reduction requires a claim");
     let n_claims = claims.len();
     let claim_size_padded = bytecode.bytecode_claim_size().next_multiple_of(DIGEST_LEN);
-    let bytecode_claims_fs_input = build_bytecode_claims_ingested_by_fiatshamir(&claims, claim_size_padded);
+    let bytecode_claims_fs_input = build_bytecode_claims_ingested_by_fiatshamir(claims, claim_size_padded);
 
-    let mut reduction_capacity = fiat_shamir_domain_sep(bytecode);
+    let mut reduction_capacity = initial_cap;
     reduction_capacity[0] += F::ONE; // Domain-separate this sub-protocol's Fiat-Shamir from the main snark
     let mut reduction_prover = ProverState::new(get_poseidon16().clone(), reduction_capacity);
     reduction_prover.observe_scalars(&bytecode_claims_fs_input);

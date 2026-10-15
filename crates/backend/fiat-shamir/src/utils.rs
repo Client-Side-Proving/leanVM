@@ -1,6 +1,6 @@
 use field::{BasedVectorSpace, ExtensionField, Field, PrimeCharacteristicRing, PrimeField64};
 use koala_bear::symmetric::Permutation;
-use symetric::{RATE, WIDTH};
+use symetric::WIDTH;
 
 use crate::challenger::Challenger;
 
@@ -50,12 +50,7 @@ pub(crate) fn sample_vec<F: PrimeField64, EF: ExtensionField<F>, P: Permutation<
     challenger: &mut Challenger<F, P>,
     len: usize,
 ) -> Vec<EF> {
-    let sampled_fe = challenger
-        .sample_many((len * EF::DIMENSION).div_ceil(RATE))
-        .into_iter()
-        .flatten()
-        .take(len * EF::DIMENSION)
-        .collect::<Vec<F>>();
+    let sampled_fe = challenger.sample_base_scalars(len * EF::DIMENSION);
     let mut res = Vec::new();
     for chunk in sampled_fe.chunks(EF::DIMENSION) {
         res.push(EF::from_basis_coefficients_slice(chunk).unwrap());

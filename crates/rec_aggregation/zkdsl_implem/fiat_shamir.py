@@ -56,10 +56,11 @@ def fs_grinding(fs, bits):
 
     # Rate is at new_fs[8..16]; sample the first cell of it for the grinding check.
     sampled = new_fs[8]
-    debug_assert(bits <= 24)
-    match_range(bits, range(0, 25), lambda b: assert_trailing_bits_are_zeros(sampled, b))
+    debug_assert(bits <= 30)
+    match_range(bits, range(0, 31), lambda b: assert_trailing_bits_are_zeros(sampled, b))
 
-    return new_fs
+    # Subsequent challenges use a fresh permutation, independent of the checked rate.
+    return fs_duplex(new_fs)
 
 
 def assert_trailing_bits_are_zeros(value, bits: Const):
@@ -91,9 +92,11 @@ def assert_trailing_bits_are_zeros(value, bits: Const):
         assert chunks[0] == 0
         assert chunks[1] / 2 ** (bits - 12) < 2 ** (chunk_size - (bits - 12))
     else:
-        debug_assert(bits == 24)
+        debug_assert(bits <= 30)
         assert chunks[0] == 0
         assert chunks[1] == 0
+        if bits != 24:
+            assert top7 / 2 ** (bits - 24) < 2 ** (31 - bits)
 
     return
 

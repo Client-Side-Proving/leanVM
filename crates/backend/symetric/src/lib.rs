@@ -16,6 +16,9 @@ pub mod merkle;
 mod poseidon_utils;
 pub use poseidon_utils::*;
 
+mod keccak;
+pub use keccak::*;
+
 pub const DIGEST_ELEMS: usize = 8;
 pub const RATE: usize = 8;
 pub const WIDTH: usize = RATE * 2;

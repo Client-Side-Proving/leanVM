@@ -16,6 +16,9 @@ pub use execution::*;
 mod utils;
 pub(crate) use utils::*;
 
+mod grouped_bus;
+pub use grouped_bus::*;
+
 // In logup interractions, the `domainsep` is the last entry of every tuple going into
 // the bus. It separates the two precompile tables from each other (Poseidon16 is odd,
 // ExtensionOp is a multiple of 4), and — since every value is odd `>= 3` (Poseidon16) or

@@ -1,6 +1,11 @@
-/target
+target/
+__pycache__/
+*.py[cod]
+.DS_Store
+/benchmark-results/
 .vscode
 /docs/benchmark_graphs/.venv
 minimal_zkVM.synctex.gz
 .claude
 misc/.build
+/crates/spartan_whir_guest/testdata/**/*_profile.json

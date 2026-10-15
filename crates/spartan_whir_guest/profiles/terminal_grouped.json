@@ -1,0 +1,42 @@
+{
+  "direct": {
+    "first_folding_factor": 6,
+    "grinding_bits": 22,
+    "log_inv_rate": 1,
+    "max_num_variables_to_send_coeffs": 5,
+    "rs_domain_initial_reduction_factor": 2,
+    "security_bits": 100,
+    "subsequent_folding_factor": 4
+  },
+  "guest_extension_arithmetic": true,
+  "guest_transcript_blocks": true,
+  "lift": {
+    "first_folding_factor": 5,
+    "grinding_bits": 24,
+    "log_inv_rate": 4,
+    "max_num_variables_to_send_coeffs": 3,
+    "rs_domain_initial_reduction_factor": 1,
+    "security_bits": 100,
+    "subsequent_folding_factor": 4
+  },
+  "lift_child_num_variables": 29,
+  "node": {
+    "first_folding_factor": 5,
+    "grinding_bits": 28,
+    "log_inv_rate": 6,
+    "max_num_variables_to_send_coeffs": 6,
+    "rs_domain_initial_reduction_factor": 1,
+    "security_bits": 100,
+    "subsequent_folding_factor": 4
+  },
+  "node_child_num_variables": 23,
+  "terminal_keccak": true,
+  "terminal_public_memory": true,
+  "terminal_two_commitment": true,
+  "verifier_options": {
+    "extension_subtractions": true,
+    "fft_poseidon_mds": true,
+    "horner_evaluation": true
+  },
+  "terminal_grouped_logup": true
+}

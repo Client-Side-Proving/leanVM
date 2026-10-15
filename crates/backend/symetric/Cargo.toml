@@ -8,3 +8,4 @@ koala-bear = { path = "../koala-bear", package = "koala-bear" }
 field = { path = "../field", package = "field" }
 parallel.workspace = true
 zk-alloc.workspace = true
+sha3 = "0.11"

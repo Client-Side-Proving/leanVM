@@ -6,7 +6,8 @@ use crate::{
     quotient_gkr::{
         layers::LayerStorage,
         sumcheck_utils::{
-            even_odd_split, quotient_sumcheck_prove_packed_br_base, run_phase1_sumcheck, run_phase2_sumcheck,
+            even_odd_split, quotient_sumcheck_prove_packed_br_base_in_place, quotient_sumcheck_prove_reduced_initial,
+            run_phase1_sumcheck, run_phase2_sumcheck,
         },
     },
 };
@@ -29,7 +30,7 @@ pub const ENDIANNESS_PIVOT_GKR: usize = 12;
 pub fn prove_gkr_quotient<'a, EF: KoalaBearExtension>(
     prover_state: &mut impl FSProver<EF>,
     nums_br: &'a [PFPacking<EF>], // already bit-reversed at `pivot`, ACTIVE prefix only (i.e. length may not be a power of 2)
-    dens_br: &'a [EFPacking<EF>], // same as above
+    dens_br: ArenaVec<EFPacking<EF>>, // same active prefix as `nums_br`
     pivot: usize,
 ) -> (EF, MultilinearPoint<EF>) {
     let w = packing_log_width::<EF>();
@@ -40,26 +41,30 @@ pub fn prove_gkr_quotient<'a, EF: KoalaBearExtension>(
 
     let initial = LayerStorage::Initial {
         nums: ArenaCow::Borrowed(nums_br),
-        dens: ArenaCow::Borrowed(dens_br),
+        dens: ArenaCow::Owned(dens_br),
         chunk_log: pivot,
     };
 
-    let mut layers: Vec<LayerStorage<'a, EF>> = vec![initial];
-
-    let mut current_n_vars = total_n_vars;
-    while current_n_vars > N_VARS_TO_SEND_GKR_COEFFS {
-        let last_layer = layers.last().unwrap();
-        if last_layer.chunk_log() == w {
-            let last_layer_unreversed = last_layer.convert_to_natural();
-            layers.push(last_layer_unreversed.sum_quotients_2_by_2());
-        } else {
-            layers.push(last_layer.sum_quotients_2_by_2());
-        }
-
-        current_n_vars -= 1;
+    // Build every second layer directly. Intervening layers are rebuilt once when the transcript
+    // reaches them in reverse order. The direct four-to-one reduction avoids materializing the
+    // largest skipped layer during construction.
+    let top_level = total_n_vars - N_VARS_TO_SEND_GKR_COEFFS;
+    let mut retained_layers: Vec<(usize, LayerStorage<'a, EF>)> = vec![(0, initial)];
+    let mut current_level = 0;
+    while current_level + 1 < top_level {
+        let next_layer = retained_layers.last().unwrap().1.sum_quotients_4_by_4(w);
+        current_level += 2;
+        retained_layers.push((current_level, next_layer));
     }
 
-    let (top_nums, top_dens) = layers.pop().unwrap().materialise_in_full();
+    let (top_nums, top_dens) = if current_level == top_level {
+        let (top_level, top_layer) = retained_layers.pop().unwrap();
+        debug_assert_eq!(top_level, current_level);
+        top_layer.materialise_in_full()
+    } else {
+        debug_assert_eq!(current_level + 1, top_level);
+        reduce_layer(&retained_layers.last().unwrap().1, w).materialise_in_full()
+    };
     prover_state.add_extension_scalars(&top_nums);
     prover_state.add_extension_scalars(&top_dens);
     let quotient = compute_quotient(&top_nums, &top_dens).expect("prover produced a zero denominator"); // completeness error, happens with proba arround 1/2^128
@@ -68,16 +73,65 @@ pub fn prove_gkr_quotient<'a, EF: KoalaBearExtension>(
     let mut claim_num = top_nums.evaluate(&point);
     let mut claim_den = top_dens.evaluate(&point);
 
-    for layer in layers.iter().rev() {
-        (point, claim_num, claim_den) = prove_gkr_layer(prover_state, layer, &point, claim_num, claim_den);
+    let mut scratch_layer: Option<LayerStorage<'a, EF>> = None;
+    for level in (0..top_level).rev() {
+        if level.is_multiple_of(2) {
+            let (retained_level, layer) = retained_layers.pop().unwrap();
+            debug_assert_eq!(retained_level, level);
+            (point, claim_num, claim_den) = prove_gkr_layer(prover_state, layer, &point, claim_num, claim_den);
+        } else {
+            let (retained_level, source) = retained_layers.last().unwrap();
+            debug_assert_eq!(*retained_level + 1, level);
+            if level == 1 {
+                (point, claim_num, claim_den) =
+                    prove_gkr_layer_one_from_initial(prover_state, source, &point, claim_num, claim_den);
+            } else {
+                if let Some(scratch) = &mut scratch_layer {
+                    reduce_layer_reusing(source, w, scratch);
+                } else {
+                    scratch_layer = Some(reduce_layer(source, w));
+                }
+                (point, claim_num, claim_den) = prove_gkr_layer(
+                    prover_state,
+                    scratch_layer.take().unwrap(),
+                    &point,
+                    claim_num,
+                    claim_den,
+                );
+            }
+        }
     }
+    debug_assert!(retained_layers.is_empty());
 
     (quotient, point)
 }
 
+fn reduce_layer<'a, EF: KoalaBearExtension>(
+    layer: &LayerStorage<'a, EF>,
+    packing_log_width: usize,
+) -> LayerStorage<'a, EF> {
+    if layer.chunk_log() == packing_log_width {
+        layer.convert_to_natural().sum_quotients_2_by_2()
+    } else {
+        layer.sum_quotients_2_by_2()
+    }
+}
+
+fn reduce_layer_reusing<'a, EF: KoalaBearExtension>(
+    layer: &LayerStorage<'a, EF>,
+    packing_log_width: usize,
+    output: &mut LayerStorage<'a, EF>,
+) {
+    if layer.chunk_log() == packing_log_width {
+        *output = layer.convert_to_natural().sum_quotients_2_by_2();
+    } else {
+        layer.sum_quotients_2_by_2_reusing(output);
+    }
+}
+
 fn prove_gkr_layer<EF: KoalaBearExtension>(
     prover_state: &mut impl FSProver<EF>,
-    layer: &LayerStorage<'_, EF>,
+    layer: LayerStorage<'_, EF>,
     claim_point: &MultilinearPoint<EF>, // K coords, natural order
     claim_num: EF,
     claim_den: EF,
@@ -87,20 +141,25 @@ fn prove_gkr_layer<EF: KoalaBearExtension>(
     let expected_sum = claim_num + alpha * claim_den;
 
     let (mut q_natural, inner_evals) = match layer {
-        LayerStorage::Initial { nums, dens, chunk_log } => quotient_sumcheck_prove_packed_br_base(
+        LayerStorage::Initial {
+            nums,
+            dens: ArenaCow::Owned(dens),
+            chunk_log,
+        } => quotient_sumcheck_prove_packed_br_base_in_place(
             prover_state,
             nums.as_ref(),
-            dens.as_ref(),
-            *chunk_log,
+            dens,
+            chunk_log,
             &claim_point.0,
             alpha,
             expected_sum,
         ),
+        LayerStorage::Initial { .. } => unreachable!(),
         LayerStorage::PackedBr { nums, dens, chunk_log } => run_phase1_sumcheck(
             prover_state,
-            nums.as_ref().into(),
-            dens.as_ref().into(),
-            *chunk_log,
+            nums,
+            dens,
+            chunk_log,
             claim_point.0.to_vec(),
             vec![],
             alpha,
@@ -110,8 +169,8 @@ fn prove_gkr_layer<EF: KoalaBearExtension>(
             None,
         ),
         LayerStorage::Natural { nums, dens } => {
-            let (num_l, num_r) = even_odd_split(nums);
-            let (den_l, den_r) = even_odd_split(dens);
+            let (num_l, num_r) = even_odd_split(nums.as_ref());
+            let (den_l, den_r) = even_odd_split(dens.as_ref());
             run_phase2_sumcheck(
                 prover_state,
                 num_l,
@@ -126,6 +185,41 @@ fn prove_gkr_layer<EF: KoalaBearExtension>(
             )
         }
     };
+
+    prover_state.add_extension_scalars(&inner_evals);
+    let beta = prover_state.sample();
+    let [nl_q, nr_q, dl_q, dr_q] = inner_evals;
+    let one_minus_beta = EF::ONE - beta;
+    let next_num = one_minus_beta * nl_q + beta * nr_q;
+    let next_den = one_minus_beta * dl_q + beta * dr_q;
+
+    q_natural.push(beta);
+    (MultilinearPoint(q_natural), next_num, next_den)
+}
+
+fn prove_gkr_layer_one_from_initial<EF: KoalaBearExtension>(
+    prover_state: &mut impl FSProver<EF>,
+    initial_layer: &LayerStorage<'_, EF>,
+    claim_point: &MultilinearPoint<EF>,
+    claim_num: EF,
+    claim_den: EF,
+) -> (MultilinearPoint<EF>, EF, EF) {
+    let LayerStorage::Initial { nums, dens, chunk_log } = initial_layer else {
+        unreachable!()
+    };
+
+    prover_state.duplex();
+    let alpha = prover_state.sample();
+    let expected_sum = claim_num + alpha * claim_den;
+    let (mut q_natural, inner_evals) = quotient_sumcheck_prove_reduced_initial(
+        prover_state,
+        nums.as_ref(),
+        dens.as_ref(),
+        *chunk_log,
+        &claim_point.0,
+        alpha,
+        expected_sum,
+    );
 
     prover_state.add_extension_scalars(&inner_evals);
     let beta = prover_state.sample();
@@ -203,8 +297,75 @@ mod tests {
     type F = KoalaBear;
     type EF = QuinticExtensionFieldKB;
 
+    #[test]
+    fn quotient_requires_nonzero_denominators() {
+        let send_len = 1 << N_VARS_TO_SEND_GKR_COEFFS;
+        let denominators: Vec<EF> = (0..send_len)
+            .map(|i| EF::from_basis_coefficients_fn(|j| F::from_usize(i + j + 2)))
+            .collect();
+        let quotients: Vec<EF> = (0..send_len).map(|i| EF::from_usize(i)).collect();
+        let numerators: Vec<EF> = denominators.iter().zip(&quotients).map(|(&d, &q)| d * q).collect();
+        assert_eq!(
+            compute_quotient(&numerators, &denominators),
+            Some(quotients.iter().copied().sum())
+        );
+        for position in 0..send_len {
+            for numerator in [EF::ZERO, EF::ONE] {
+                let mut numerators = numerators.clone();
+                let mut denominators = denominators.clone();
+                numerators[position] = numerator;
+                denominators[position] = EF::ZERO;
+                assert_eq!(compute_quotient(&numerators, &denominators), None);
+            }
+        }
+    }
+
     fn sum_all_quotients(nums: &[F], den: &[EF]) -> EF {
         nums.iter().zip(den).map(|(&n, &d)| EF::from(n) / d).sum()
+    }
+
+    #[test]
+    fn four_to_one_reduction_crosses_packing_boundary() {
+        let width_log = packing_log_width::<EF>();
+        for chunk_log in width_log..=width_log + 2 {
+            let len = 5 << chunk_log;
+            let nums: Vec<F> = (0..len).map(|i| F::from_usize(i + 1)).collect();
+            let dens: Vec<EF> = (0..len).map(|i| EF::from_usize(i + 2)).collect();
+            let nums_br = bit_reverse_chunks_and_pack_base::<EF>(&nums, chunk_log);
+            let dens_br = bit_reverse_chunks_and_pack_ext::<EF>(&dens, chunk_log);
+            let nums_ext: Vec<EF> = nums.iter().copied().map(EF::from).collect();
+            let nums_ext_br = bit_reverse_chunks_and_pack_ext::<EF>(&nums_ext, chunk_log);
+            let layers: [LayerStorage<'_, EF>; 2] = [
+                LayerStorage::Initial {
+                    nums: ArenaCow::Borrowed(&nums_br),
+                    dens: ArenaCow::Borrowed(&dens_br),
+                    chunk_log,
+                },
+                LayerStorage::PackedBr {
+                    nums: ArenaCow::Borrowed(&nums_ext_br),
+                    dens: ArenaCow::Borrowed(&dens_br),
+                    chunk_log,
+                },
+            ];
+            for layer in layers {
+                let expected = layer
+                    .convert_to_natural()
+                    .sum_quotients_2_by_2()
+                    .sum_quotients_2_by_2()
+                    .materialise_in_full();
+                let actual = layer.sum_quotients_4_by_4(width_log).materialise_in_full();
+                assert_eq!(
+                    actual.0.as_ref(),
+                    expected.0.as_ref(),
+                    "numerators at chunk_log={chunk_log}"
+                );
+                assert_eq!(
+                    actual.1.as_ref(),
+                    expected.1.as_ref(),
+                    "denominators at chunk_log={chunk_log}"
+                );
+            }
+        }
     }
 
     fn bit_reverse_chunks_and_pack_ext<EF: KoalaBearExtension>(v: &[EF], chunk_log: usize) -> Vec<EFPacking<EF>> {
@@ -261,7 +422,7 @@ mod tests {
         let (quotient_prover, claim_point_prover) = prove_gkr_quotient::<EF>(
             &mut prover_state,
             &nums_br[..active_packed],
-            &dens_br[..active_packed],
+            ArenaVec::from_slice(&dens_br[..active_packed]),
             pivot,
         );
         println!("Proving time: {:.3}s", time.elapsed().as_secs_f64());

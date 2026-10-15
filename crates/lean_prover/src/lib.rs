@@ -2,7 +2,18 @@
 
 use std::fmt::Display;
 
+mod grouped_execution;
+mod profile;
+pub use grouped_execution::{GROUPED_BATCHING_POW_BITS, grouped_logup_mode_observation};
 pub mod prove_execution;
+mod public_memory;
+pub use profile::{
+    TWO_COMMITMENT_WHIR_BATCHING_POW_BITS, TWO_COMMITMENT_WHIR_MODE_TAG, TWO_COMMITMENT_WHIR_STATEMENT_TAG,
+    TwoCommitmentWhirPreprocessedCommitment, TwoCommitmentWhirProverInput, TwoCommitmentWhirStatementBinding,
+    TwoCommitmentWhirVerifierInput, WhirExecutionProfile, two_commitment_fiat_shamir_domain_sep,
+    two_commitment_fiat_shamir_static_descriptor, two_commitment_statement_observation,
+};
+pub use public_memory::PublicMemoryRegion;
 mod trace_gen;
 pub mod verify_execution;
 
@@ -11,14 +22,14 @@ use lean_vm::*;
 #[cfg(test)]
 mod test_zkvm;
 
-use trace_gen::*;
+pub use trace_gen::{ExecutionTrace, get_execution_trace};
 
 // Right now, hash digests = 8 koala-bear (p = 2^31 - 2^24 + 1, i.e. ≈ 31 bits per field element)
-pub const SECURITY_BITS: usize = 124; // TODO 128 bits security
+pub const SECURITY_BITS: usize = 121;
 
 pub const GRINDING_BITS: usize = 16;
 pub const MAX_NUM_VARIABLES_TO_SEND_COEFFS: usize = 8;
-pub const WHIR_INITIAL_FOLDING_FACTOR: usize = 7;
+pub const WHIR_INITIAL_FOLDING_FACTOR: usize = 9;
 pub const WHIR_SUBSEQUENT_FOLDING_FACTOR: usize = 5;
 pub const RS_DOMAIN_INITIAL_REDUCTION_FACTOR: usize = 5;
 
@@ -61,6 +72,10 @@ pub enum ProverError {
     TooBigTable(TooBigTableError),
     Runner(RunnerError),
     InvalidRate,
+    InvalidGroupedLogup(&'static str),
+    InvalidWhirProfile(&'static str),
+    InvalidPublicMemory(&'static str),
+    InvalidTwoCommitmentWhir(&'static str),
 }
 
 impl From<TooBigTableError> for ProverError {
@@ -80,6 +95,16 @@ impl Display for ProverError {
         match self {
             Self::TooBigTable(e) => write!(f, "{}", e),
             Self::Runner(e) => write!(f, "{}", e),
+            Self::InvalidWhirProfile(reason) => {
+                write!(f, "Invalid WHIR execution profile: {reason}")
+            }
+            Self::InvalidPublicMemory(reason) => {
+                write!(f, "Invalid public memory region: {reason}")
+            }
+            Self::InvalidTwoCommitmentWhir(reason) => {
+                write!(f, "Invalid two-commitment WHIR input: {reason}")
+            }
+            Self::InvalidGroupedLogup(reason) => write!(f, "Invalid grouped LogUp input: {reason}"),
             Self::InvalidRate => write!(
                 f,
                 "LeanVM supports rate 1/2, 1/4, 1/8 and 1/16 (log_inv_rate in {{1, 2, 3, 4}})"

@@ -27,6 +27,7 @@ pub struct GenericLogupStatements {
 pub fn prove_generic_logup(
     prover_state: &mut impl FSProver<EF>,
     c: EF,
+    alphas: &[EF],
     alphas_eq_poly: &[EF],
     memory: &[F],
     memory_acc: &[F],
@@ -236,7 +237,7 @@ pub fn prove_generic_logup(
     let (sum, claim_point_gkr) = prove_gkr_quotient::<EF>(
         prover_state,
         PFPacking::<EF>::pack_slice(&numerators),
-        &denominators,
+        denominators,
         pivot,
     );
 
@@ -255,7 +256,10 @@ pub fn prove_generic_logup(
     let value_bytecode_acc = eval_base_packed::<EF, true>(bytecode_acc, &bytecode_and_acc_point.0);
     prover_state.add_extension_scalar(value_bytecode_acc);
 
-    // evaluation on bytecode itself can be done directly by the verifier
+    let mut bytecode_point = bytecode_and_acc_point.0.clone();
+    bytecode_point.extend(from_end(alphas, log2_ceil_usize(N_INSTRUCTION_COLUMNS)));
+    let bytecode_point = MultilinearPoint(bytecode_point);
+    let bytecode_value = bytecode_multilinear.evaluate_sequential(&bytecode_point);
 
     let mut bus_numerators_values = BTreeMap::new();
     let mut bus_denominators_values = BTreeMap::new();
@@ -328,7 +332,7 @@ pub fn prove_generic_logup(
         gkr_point: claim_point_gkr.0,
         columns_values,
         total_gkr_n_vars,
-        bytecode_evaluation: None,
+        bytecode_evaluation: Some(Evaluation::new(bytecode_point, bytecode_value)),
     }
 }
 

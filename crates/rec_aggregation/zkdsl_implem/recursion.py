@@ -47,6 +47,20 @@ BYTECODE_CLAIM_SIZE_PADDED = next_multiple_of(BYTECODE_CLAIM_SIZE, DIGEST_LEN)
 INNER_PUBLIC_MEMORY_LOG_SIZE = 3  # public input = 1 hash digest = 8 field elements
 PUB_INPUT_SIZE = DIGEST_LEN  # the public input is a single digest
 
+FIXED_CHILD_SHAPE = FIXED_CHILD_SHAPE_PLACEHOLDER
+FIXED_WHIR_LOG_INV_RATE = FIXED_WHIR_LOG_INV_RATE_PLACEHOLDER
+FIXED_LOG_MEMORY = FIXED_LOG_MEMORY_PLACEHOLDER
+FIXED_TABLE_LOG_HEIGHTS = FIXED_TABLE_LOG_HEIGHTS_PLACEHOLDER
+FIXED_TABLE_HEIGHTS = FIXED_TABLE_HEIGHTS_PLACEHOLDER
+FIXED_LOG_MAX_TABLE_HEIGHT = FIXED_LOG_MAX_TABLE_HEIGHT_PLACEHOLDER
+FIXED_LOG_N_CYCLES = FIXED_LOG_N_CYCLES_PLACEHOLDER
+FIXED_LOG_BYTECODE_PADDED = FIXED_LOG_BYTECODE_PADDED_PLACEHOLDER
+FIXED_STACKED_N_VARS = FIXED_STACKED_N_VARS_PLACEHOLDER
+FIXED_LOGUP_GKR_N_VARS = FIXED_LOGUP_GKR_N_VARS_PLACEHOLDER
+FIXED_GKR_TABLE_BASE_OFFSETS = FIXED_GKR_TABLE_BASE_OFFSETS_PLACEHOLDER
+FIXED_STACKED_TABLE_BASE_OFFSETS = FIXED_STACKED_TABLE_BASE_OFFSETS_PLACEHOLDER
+FIXED_GKR_ACTIVE_LEN = FIXED_GKR_ACTIVE_LEN_PLACEHOLDER
+
 
 def recursion(inner_public_memory, initial_fiat_shamir_cap):
     proof_transcript_size_buf = Array(1)
@@ -62,68 +76,95 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     fs, dims = fs_receive_chunks(fs, 1)
     for i in unroll(N_TABLES + 2, 8):
         assert dims[i] == 0
-    whir_log_inv_rate = dims[0]
-    log_memory = dims[1]
-    table_log_heights = dims + 2
+    whir_log_inv_rate: Imm
+    log_memory: Imm
+    table_log_heights: Imm
+    table_heights: Imm
+    sorted_tables: Imm
+    log_max_table_height: Imm
+    log_n_cycles: Imm
+    log_bytecode_padded: Imm
+    stacked_n_vars: Imm
+    n_vars_logup_gkr: Imm
+    gkr_table_base_offset: Imm
+    stacked_table_base_offset: Imm
+    gkr_cumul: Mut
+    if FIXED_CHILD_SHAPE == 1:
+        assert dims[0] == FIXED_WHIR_LOG_INV_RATE
+        assert dims[1] == FIXED_LOG_MEMORY
+        for i in unroll(0, N_TABLES):
+            assert dims[i + 2] == FIXED_TABLE_LOG_HEIGHTS[i]
+        whir_log_inv_rate = FIXED_WHIR_LOG_INV_RATE
+        log_memory = FIXED_LOG_MEMORY
+        log_max_table_height = FIXED_LOG_MAX_TABLE_HEIGHT
+        log_n_cycles = FIXED_LOG_N_CYCLES
+        log_bytecode_padded = FIXED_LOG_BYTECODE_PADDED
+        stacked_n_vars = FIXED_STACKED_N_VARS
+        n_vars_logup_gkr = FIXED_LOGUP_GKR_N_VARS
+        gkr_cumul = FIXED_GKR_ACTIVE_LEN
+    else:
+        whir_log_inv_rate = dims[0]
+        log_memory = dims[1]
+        table_log_heights = dims + 2
 
-    assert MIN_WHIR_LOG_INV_RATE <= whir_log_inv_rate
-    assert whir_log_inv_rate <= MAX_WHIR_LOG_INV_RATE
+        assert MIN_WHIR_LOG_INV_RATE <= whir_log_inv_rate
+        assert whir_log_inv_rate <= MAX_WHIR_LOG_INV_RATE
 
-    table_heights = Array(N_TABLES)
-    for i in unroll(0, N_TABLES):
-        table_log_height = table_log_heights[i]
-        assert table_log_height <= MAX_LOG_N_ROWS_PER_TABLE[i]
-        assert MIN_LOG_N_ROWS_PER_TABLE <= table_log_height
-        table_heights[i] = two_exp(table_log_height)
+        table_heights = Array(N_TABLES)
+        for i in unroll(0, N_TABLES):
+            table_log_height = table_log_heights[i]
+            assert table_log_height <= MAX_LOG_N_ROWS_PER_TABLE[i]
+            assert MIN_LOG_N_ROWS_PER_TABLE <= table_log_height
+            table_heights[i] = two_exp(table_log_height)
 
-    sorted_tables = Array(N_TABLES) # sorted_tables[0] is the index of the biggest table, sorted_tables[1] is the index of the second biggest table, etc
-    hint_witness("table_sort_perm", sorted_tables)
-    # Force table_sort_perm to be a permutation of {0..N_TABLES-1}
-    perm_seen = Array(N_TABLES)
-    for i in unroll(0, N_TABLES):
-        p = sorted_tables[i]
-        assert p < N_TABLES
-        perm_seen[p] = i
-    
-    for i in unroll(0, N_TABLES - 1):
-        height_curr = table_log_heights[sorted_tables[i]]
-        height_next = table_log_heights[sorted_tables[i + 1]]
-        assert height_next <= height_curr
-        if height_curr == height_next:
-            assert sorted_tables[i] < sorted_tables[i + 1]
+        sorted_tables = Array(N_TABLES) # sorted_tables[0] is the index of the biggest table, sorted_tables[1] is the index of the second biggest table, etc
+        hint_witness("table_sort_perm", sorted_tables)
+        # Force table_sort_perm to be a permutation of {0..N_TABLES-1}
+        perm_seen = Array(N_TABLES)
+        for i in unroll(0, N_TABLES):
+            p = sorted_tables[i]
+            assert p < N_TABLES
+            perm_seen[p] = i
 
-    assert MIN_LOG_MEMORY_SIZE <= log_memory
-    assert log_memory <= MAX_LOG_MEMORY_SIZE
-    assert LOG_GUEST_BYTECODE_LEN <= log_memory
+        for i in unroll(0, N_TABLES - 1):
+            height_curr = table_log_heights[sorted_tables[i]]
+            height_next = table_log_heights[sorted_tables[i + 1]]
+            assert height_next <= height_curr
+            if height_curr == height_next:
+                assert sorted_tables[i] < sorted_tables[i + 1]
 
-    log_max_table_height = table_log_heights[sorted_tables[0]]  # largest table's log height
-    assert log_max_table_height <= log_memory
-    log_n_cycles = table_log_heights[EXECUTION_TABLE_INDEX]
+        assert MIN_LOG_MEMORY_SIZE <= log_memory
+        assert log_memory <= MAX_LOG_MEMORY_SIZE
+        assert LOG_GUEST_BYTECODE_LEN <= log_memory
 
-    log_bytecode_padded = maximum(LOG_GUEST_BYTECODE_LEN, log_max_table_height)
+        log_max_table_height = table_log_heights[sorted_tables[0]]  # largest table's log height
+        assert log_max_table_height <= log_memory
+        log_n_cycles = table_log_heights[EXECUTION_TABLE_INDEX]
 
-    stacked_n_vars = compute_stacked_n_vars(log_memory, log_bytecode_padded, table_heights)
-    assert stacked_n_vars <= TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - whir_log_inv_rate
+        log_bytecode_padded = maximum(LOG_GUEST_BYTECODE_LEN, log_max_table_height)
 
-    n_vars_logup_gkr = compute_total_gkr_n_vars(log_memory, log_bytecode_padded, table_heights)
+        stacked_n_vars = compute_stacked_n_vars(log_memory, log_bytecode_padded, table_heights)
+        assert stacked_n_vars <= TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - whir_log_inv_rate
 
-    n_buses_per_table = Array(N_TABLES) # indexed by table_index
-    n_cols_per_table = Array(N_TABLES) # indexed by table_index
-    for i in unroll(0, N_TABLES):
-        n_buses_per_table[i] = len(ONE_BUSES_DOMSEPS[i]) + 1 # + 1 for the precompile bus interaction (the rest is memory / bytecode interactions)
-        n_cols_per_table[i] = NUM_COLS_AIR[i]
+        n_vars_logup_gkr = compute_total_gkr_n_vars(log_memory, log_bytecode_padded, table_heights)
 
-    gkr_table_base_offset = Array(N_TABLES)
-    stacked_table_base_offset = Array(N_TABLES)
-    gkr_cumul: Mut = two_exp(log_memory) + two_exp(log_bytecode_padded)
-    stacked_cumul: Mut = two_exp(log_memory) * 2 + two_exp(log_bytecode_padded)
-    for sorted_pos in unroll(0, N_TABLES):
-        ti = sorted_tables[sorted_pos]
-        gkr_table_base_offset[ti] = gkr_cumul
-        stacked_table_base_offset[ti] = stacked_cumul
-        n_rows = table_heights[ti]
-        gkr_cumul += n_rows * n_buses_per_table[ti]
-        stacked_cumul += n_rows * n_cols_per_table[ti]
+        n_buses_per_table = Array(N_TABLES) # indexed by table_index
+        n_cols_per_table = Array(N_TABLES) # indexed by table_index
+        for i in unroll(0, N_TABLES):
+            n_buses_per_table[i] = len(ONE_BUSES_DOMSEPS[i]) + 1 # + 1 for the precompile bus interaction (the rest is memory / bytecode interactions)
+            n_cols_per_table[i] = NUM_COLS_AIR[i]
+
+        gkr_table_base_offset = Array(N_TABLES)
+        stacked_table_base_offset = Array(N_TABLES)
+        gkr_cumul = two_exp(log_memory) + two_exp(log_bytecode_padded)
+        stacked_cumul: Mut = two_exp(log_memory) * 2 + two_exp(log_bytecode_padded)
+        for sorted_pos in unroll(0, N_TABLES):
+            ti = sorted_tables[sorted_pos]
+            gkr_table_base_offset[ti] = gkr_cumul
+            stacked_table_base_offset[ti] = stacked_cumul
+            n_rows = table_heights[ti]
+            gkr_cumul += n_rows * n_buses_per_table[ti]
+            stacked_cumul += n_rows * n_cols_per_table[ti]
 
     num_oods = get_num_oods(whir_log_inv_rate, stacked_n_vars)
     num_ood_at_commitment = num_oods[0]
@@ -226,9 +267,17 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     pcs_shifts_air = Array(N_TABLES * MAX_NUM_COLS_AIR)
 
     for table_index in unroll(0, N_TABLES):
-        log_n_rows = table_log_heights[table_index]
-        n_rows = table_heights[table_index]
-        offset: Mut = gkr_table_base_offset[table_index]
+        log_n_rows: Imm
+        n_rows: Imm
+        offset: Mut
+        if FIXED_CHILD_SHAPE == 1:
+            log_n_rows = FIXED_TABLE_LOG_HEIGHTS[table_index]
+            n_rows = FIXED_TABLE_HEIGHTS[table_index]
+            offset = FIXED_GKR_TABLE_BASE_OFFSETS[table_index]
+        else:
+            log_n_rows = table_log_heights[table_index]
+            n_rows = table_heights[table_index]
+            offset = gkr_table_base_offset[table_index]
 
         inner_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
         pcs_inner_points[table_index] = inner_point
@@ -325,7 +374,11 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
 
     check_sum: Mut = ZERO_VEC_PTR
     for table_index in unroll(0, N_TABLES):
-        log_n_rows = table_log_heights[table_index]
+        log_n_rows: Imm
+        if FIXED_CHILD_SHAPE == 1:
+            log_n_rows = FIXED_TABLE_LOG_HEIGHTS[table_index]
+        else:
+            log_n_rows = table_log_heights[table_index]
         n_flat_columns = N_AIR_COLUMNS[table_index]
         n_shift_columns = N_AIR_SHIFT_COLUMNS[table_index]
         alpha_offset = AIR_ALPHA_OFFSETS[table_index]
@@ -482,10 +535,18 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     curr_randomness += DIM
 
     for table_index in unroll(0, N_TABLES):
-        log_n_rows = table_log_heights[table_index]
-        n_rows = table_heights[table_index]
+        log_n_rows: Imm
+        n_rows: Imm
+        table_offset: Imm
+        if FIXED_CHILD_SHAPE == 1:
+            log_n_rows = FIXED_TABLE_LOG_HEIGHTS[table_index]
+            n_rows = FIXED_TABLE_HEIGHTS[table_index]
+            table_offset = FIXED_STACKED_TABLE_BASE_OFFSETS[table_index]
+        else:
+            log_n_rows = table_log_heights[table_index]
+            n_rows = table_heights[table_index]
+            table_offset = stacked_table_base_offset[table_index]
         total_num_cols = NUM_COLS_AIR[table_index]
-        table_offset = stacked_table_base_offset[table_index]
 
         if table_index == EXECUTION_TABLE_INDEX:
             prefix_pc_start = multilinear_location_prefix(
@@ -605,7 +666,7 @@ def verify_gkr_quotient(prev_fs, n_vars):
 
     initial_quotients = Array(LOGUP_GKR_N_COEFFS_SENT * DIM)
     for k in unroll(0, LOGUP_GKR_N_COEFFS_SENT):
-        div_extension(nums + k * DIM, denoms + k * DIM, initial_quotients + k * DIM)
+        div_extension_nonzero(nums + k * DIM, denoms + k * DIM, initial_quotients + k * DIM)
     debug_assert(NUM_REPEATED_ONES <= LOGUP_GKR_N_COEFFS_SENT)
     debug_assert(LOGUP_GKR_N_COEFFS_SENT % NUM_REPEATED_ONES == 0)
     quotient: Mut = ZERO_VEC_PTR

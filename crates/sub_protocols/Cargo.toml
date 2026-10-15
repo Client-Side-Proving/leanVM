@@ -14,4 +14,5 @@ backend.workspace = true
 [dev-dependencies]
 rand.workspace = true
 lean_prover.workspace = true
-
+lean_compiler.workspace = true
+serde_json.workspace = true

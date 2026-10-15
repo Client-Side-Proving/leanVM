@@ -1,0 +1,261 @@
+{
+  "base_words": 1048576,
+  "cases": [
+    {
+      "expected": "reject",
+      "field": "public statement",
+      "name": "changed_public_input",
+      "patches": [
+        {
+          "after": 1,
+          "before": 0,
+          "offset": 10
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 1107949: prev=1334408670, new=1645173181",
+      "assertion_site": "public statement"
+    },
+    {
+      "expected": "reject",
+      "field": "application mask commitment",
+      "name": "changed_application_mask_commitment",
+      "patches": [
+        {
+          "after": 824967417,
+          "before": 824967416,
+          "offset": 276
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 1465830: prev=1388558158, new=818719835",
+      "assertion_site": "application mask commitment"
+    },
+    {
+      "expected": "reject",
+      "field": "SPARK product sumcheck",
+      "name": "changed_spark_product_sumcheck",
+      "patches": [
+        {
+          "after": 1312597610,
+          "before": 1312597609,
+          "offset": 1541
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 1745467: prev=1158185831, new=854203422",
+      "assertion_site": "SPARK product sumcheck"
+    },
+    {
+      "expected": "reject",
+      "field": "SPARK fixed-table opening",
+      "name": "changed_spark_fixed_opening",
+      "patches": [
+        {
+          "after": 1935810914,
+          "before": 1935810913,
+          "offset": 10654
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 4521091: prev=1, new=0",
+      "assertion_site": "SPARK fixed-table opening"
+    },
+    {
+      "expected": "reject",
+      "field": "SPARK read-table opening",
+      "name": "changed_spark_read_opening",
+      "patches": [
+        {
+          "after": 1674270127,
+          "before": 1674270126,
+          "offset": 140342
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 10122232: prev=1, new=0",
+      "assertion_site": "SPARK read-table opening"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR relation",
+      "name": "changed_hiding_whir_relation",
+      "patches": [
+        {
+          "after": 2073607595,
+          "before": 2073607594,
+          "offset": 476074
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 28300415: prev=1504315907, new=1691818513",
+      "assertion_site": "hiding-WHIR relation"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR relation sumcheck",
+      "name": "changed_relation_sumcheck",
+      "patches": [
+        {
+          "after": 1274678730,
+          "before": 1274678729,
+          "offset": 389856
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 20792462: prev=1, new=0",
+      "assertion_site": "hiding-WHIR relation sumcheck"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR code-switch commitment",
+      "name": "changed_code_switch_commitment",
+      "patches": [
+        {
+          "after": 2111001415,
+          "before": 2111001414,
+          "offset": 390070
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 20824133: prev=1, new=0",
+      "assertion_site": "hiding-WHIR code-switch commitment"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR code-switch opening",
+      "name": "changed_code_switch_opening",
+      "patches": [
+        {
+          "after": 897101704,
+          "before": 897101703,
+          "offset": 390097
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 312: prev=342111215, new=1133018477",
+      "assertion_site": "hiding-WHIR code-switch opening"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR mask reveal",
+      "name": "changed_mask_reveal",
+      "patches": [
+        {
+          "after": 1620706131,
+          "before": 1620706130,
+          "offset": 477023
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 28300415: prev=1691818513, new=1582670096",
+      "assertion_site": "hiding-WHIR mask reveal"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR mask opening",
+      "name": "changed_mask_opening",
+      "patches": [
+        {
+          "after": 968740461,
+          "before": 968740460,
+          "offset": 494744
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 29749624: prev=1722383069, new=183319804",
+      "assertion_site": "hiding-WHIR mask opening"
+    },
+    {
+      "expected": "reject",
+      "field": "hiding-WHIR source opening",
+      "name": "changed_source_opening",
+      "patches": [
+        {
+          "after": 1897856805,
+          "before": 1897856804,
+          "offset": 484015
+        }
+      ],
+      "preflight": "native verifier rejected the mutated proof",
+      "expected_guest_error": "LeanVM execution failed: memory already set at 467811: prev=2110415162, new=1670218466",
+      "assertion_site": "hiding-WHIR source opening"
+    },
+    {
+      "expected": "reject",
+      "field": "encoding version",
+      "name": "wrong_version",
+      "patches": [
+        {
+          "after": 3,
+          "before": 2,
+          "offset": 4
+        }
+      ],
+      "preflight": "guest header check",
+      "expected_guest_error": "LeanVM execution failed: not equal: 3 != 2",
+      "assertion_site": "encoding version"
+    },
+    {
+      "expected": "reject",
+      "field": "hash profile",
+      "name": "wrong_hash_profile",
+      "patches": [
+        {
+          "after": 1,
+          "before": 2,
+          "offset": 5
+        }
+      ],
+      "preflight": "guest header check",
+      "expected_guest_error": "LeanVM execution failed: not equal: 1 != 2",
+      "assertion_site": "hash profile"
+    },
+    {
+      "expected": "reject",
+      "field": "matrix-closing tag",
+      "name": "wrong_matrix_closing",
+      "patches": [
+        {
+          "after": 0,
+          "before": 1,
+          "offset": 7
+        }
+      ],
+      "preflight": "guest header check",
+      "expected_guest_error": "LeanVM execution failed: not equal: 0 != 1",
+      "assertion_site": "matrix-closing tag"
+    },
+    {
+      "expected": "reject",
+      "field": "exact canonical proof consumption",
+      "name": "trailing_word",
+      "patches": [
+        {
+          "after": 527388,
+          "before": 527387,
+          "offset": 8
+        }
+      ],
+      "preflight": "guest exact-consumption check",
+      "expected_guest_error": "LeanVM execution failed: not equal: 527388 != 527387",
+      "assertion_site": "exact canonical proof consumption"
+    },
+    {
+      "expected": "reject",
+      "field": "canonical proof length",
+      "name": "wrong_total_words",
+      "patches": [
+        {
+          "after": 527386,
+          "before": 527387,
+          "offset": 8
+        }
+      ],
+      "preflight": "guest exact-consumption check",
+      "expected_guest_error": "LeanVM execution failed: not equal: 527386 != 527387",
+      "assertion_site": "canonical proof length"
+    }
+  ],
+  "schema": "leanvm-full-zk-spark-word-patches-v1"
+}
