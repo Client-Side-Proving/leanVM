@@ -69,7 +69,7 @@ def plain_events(name: str, config: dict):
     rounds = config["rounds"] + [config["final_round"]]
     phases = [phase_shape(item) for item in rounds]
     events = []
-    source = "vendor/p3-whir/src/pcs/{verifier,prover}/mod.rs"
+    source = "Plonky3 repository: whir/src/pcs/{verifier,prover}/mod.rs"
     for index, phase in enumerate(phases):
         label = f"phase{index}"
         events.append(Event(name, label + ".mca", phase["fold"], phase["mca_bits"],

@@ -166,7 +166,7 @@ Every continuation keeps the carried claim at coefficient one and assigns the fr
 | --- | --- | --- |
 | Native LeanVM | `crates/whir/src/verify.rs`, `crates/whir/src/open.rs` | Same verifier |
 | Recursive LeanVM | `crates/rec_aggregation/zkdsl_implem/whir.py` | Saved continuation coefficients |
-| Client plain WHIR | `../spartan-whir/vendor/p3-whir/src/pcs/{prover,verifier}/mod.rs` uses `Constraint::new_continuation` | `../spartan-whir/vendor/p3-sumcheck/src/constraints/mod.rs::challenge_powers` |
+| Client plain WHIR | `whir/src/pcs/{prover,verifier}/mod.rs` in the [Plonky3 fork](https://github.com/Client-Side-Proving/Plonky3) uses `Constraint::new_continuation` | `sumcheck/src/constraints/mod.rs::challenge_powers` in the same repository |
 | Client plain WHIR guest | `crates/spartan_whir_guest/zkdsl_implem/plain_whir_poseidon1.py::plain_combine_continuation` | `accumulate_plain_round_weight` |
 | Client hiding WHIR | Pinned `whir/src/pcs/zk/verifier/mod.rs` uses `shifted_powers(combination)` | The same saved coefficient vector |
 
